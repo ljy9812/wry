@@ -1123,6 +1123,15 @@ impl InnerWebView {
   /// resize, which writes this cache). ArkUI-initiated layout changes are not
   /// observed — no bridge writeback exists — because they do not occur under
   /// the tauri app model, where only the runtime moves webviews.
+  ///
+  /// # Render semantics (openspec ohos-webview-sizing)
+  ///
+  /// The ArkTS render layer consumes the full geometry: a create request with
+  /// explicit bounds renders the webview at the requested size (not inflated
+  /// to the container), and a runtime `set_bounds` applies position AND size —
+  /// flipping a natural-layout (bounds-less) webview away from container
+  /// following. A bounds-less webview keeps natural layout: the wrapper renders
+  /// at "100%" and follows window resizes through container layout.
   pub fn bounds(&self) -> Result<Rect> {
     Ok(*self.bounds_cache.lock().unwrap())
   }
