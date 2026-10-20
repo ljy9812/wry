@@ -485,6 +485,9 @@ pub enum NewWindowResponse {
   /// **Linux**: The webview must be related to the caller webview. See [`WebViewBuilderExtUnix::with_related_view`].
   /// **Windows**: The webview must use the same environment as the caller webview. See [`WebViewBuilderExtWindows::with_environment`].
   /// **macOS**: The webview must use the same configuration as the caller webview. See [`WebViewBuilderExtMacos::with_webview_configuration`].
+  /// **OpenHarmony**: treated like [`NewWindowResponse::Deny`] for the ArkWeb
+  /// popup itself — tauri builds its own OS window and cancels ArkWeb's popup
+  /// (see `with_new_window_req_handler`).
   #[cfg(not(any(target_os = "android", target_os = "ios")))]
   Create {
     #[cfg(all(
@@ -1024,6 +1027,11 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - **Windows:** scripts are always added to subframes regardless of the `for_main_frame_only` option.
   /// - **Android**: When [addDocumentStartJavaScript] is not supported, scripts are always injected into main frame only.
+  /// - **OpenHarmony:** scripts are injected via ArkWeb `ScriptItem`s into every
+  ///   frame matching the script rules (`"*"` plus the registered custom
+  ///   schemes), and `for_main_frame_only` is ignored. Whether `file://` pages
+  ///   are covered by the `"*"` rule is unverified — do not assume injection
+  ///   there until probed on a device.
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
   pub fn with_initialization_script_for_main_only<S: Into<String>>(
@@ -1122,6 +1130,18 @@ impl<'a> WebViewBuilder<'a> {
   /// - macOS, iOS and Linux: `<scheme_name>://<path>` (so it will be `wry://path/to/page).
   /// - Windows and Android: `http://<scheme_name>.<path>` by default (so it will be `http://wry.path/to/page`). To use `https` instead of `http`, use [`WebViewBuilderExtWindows::with_https_scheme`] and [`WebViewBuilderExtAndroid::with_https_scheme`].
   ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** when combined with
+  ///   [`PlatformSpecificWebViewAttributes::with_https_scheme`], the intercept
+  ///   channel is synchronous-only — a responder that fires after this closure
+  ///   returns (the `std::thread::spawn` pattern in the example below) has its
+  ///   result **discarded** and the request passes through (committer
+  ///   Eulogizethesun/tauri#187). On OHOS, register asynchronous handlers via
+  ///   the native (non-https) [`Self::with_custom_protocol`] /
+  ///   [`Self::with_asynchronous_custom_protocol`] path only; the https form
+  ///   requires a synchronous `responder.respond(...)`.
+  ///
   /// # Examples
   ///
   /// ```no_run
@@ -1188,6 +1208,18 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// Note, that if you do block this behavior, it won't be possible to drop files on `<input type="file">` forms.
   /// Also note, that it's not possible to manually set the value of a `<input type="file">` via JavaScript for security reasons.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** three corrected semantics (committer
+  ///   Eulogizethesun/tauri#193): ① the `bool` return value of all four event
+  ///   handlers is ignored — but the default drop behavior is NOT unblockable:
+  ///   ArkWeb consumes OS file drops by navigating to `file://<dropped file>`,
+  ///   and the ArkTS layer's `onLoadIntercept` constantly intercepts that
+  ///   navigation and forwards it as the drag-drop event, so the default
+  ///   navigation is already prevented; ② `Enter` events always carry empty
+  ///   `paths` — only `Drop` carries the dropped paths; ③ re-enabling the
+  ///   default behavior via a `bool` return is not supported.
   pub fn with_drag_drop_handler<F>(mut self, handler: F) -> Self
   where
     F: Fn(DragDropEvent) -> bool + 'static,
@@ -1987,6 +2019,16 @@ pub trait WebViewBuilderExtOhos {
   /// `tauri://localhost` scheme by default — which serves the embedded
   /// frontend bundle just fine (ArkWeb's custom-protocol handler delivers
   /// the main-frame document and `/assets/*` sub-resources).
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** the use_https intercept channel is synchronous-only
+  ///   (committer Eulogizethesun/tauri#187) — a handler that does not call
+  ///   `responder.respond(...)` before returning is treated as "no response":
+  ///   its eventual result is discarded and the request passes through (wry
+  ///   logs a warn and returns the passthrough response). Async handlers must
+  ///   use the native (non-`with_https_scheme`) custom-protocol path, which
+  ///   fully supports asynchronous responders.
   fn with_https_scheme(self, enabled: bool) -> Self;
 
   /// Enable transparent drag-drop overlay for OHOS.
@@ -2269,6 +2311,10 @@ impl WebView {
   ///
   /// This is only effective if the webview was created as a child
   /// or created using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
+  ///
+  /// OpenHarmony: the OHOS backend applies the full geometry (see the render
+  /// semantics note on `WebView::bounds`); a child webview's first
+  /// `set_bounds` flips the ArkTS node from natural layout to explicit sizing.
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
     self.webview.set_bounds(bounds)
   }
@@ -2300,6 +2346,9 @@ pub enum DragDropEvent {
   /// A drag operation has entered the webview.
   Enter {
     /// List of paths that are being dragged onto the webview.
+    ///
+    /// OpenHarmony: always empty — ArkWeb's drag-enter event carries no path
+    /// list; only [`DragDropEvent::Drop`] carries paths.
     paths: Vec<PathBuf>,
     /// Position of the drag operation, relative to the webview top-left corner.
     position: (i32, i32),
