@@ -56,9 +56,8 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
 /// margins, background printing on). Provided values are forwarded through the
 /// bridge (`WebviewPdfConfig`) and mapped per-field into ArkWeb's
 /// `PdfConfiguration` (width/height in inches) — see WebviewPlugin.ets
-/// `createPdf`. Note: `scale` is accepted for API compatibility but has no
-/// ArkWeb counterpart (`PdfConfiguration` has no scale field) and is dropped
-/// on the ArkTS side.
+/// `createPdf`. `scale` is forwarded into `PdfConfiguration.scale` (ArkTS
+/// side, #233; the system field is @since 20) instead of being dropped.
 pub struct PdfConfig {
   pub width: Option<f64>,
   pub height: Option<f64>,
@@ -237,13 +236,15 @@ impl PendingOp {
         }
       }
       PendingOp::Eval(js, callback) => {
-        match handle.evaluate_script(js).await {
-          Ok(result) => {
-            if let Some(cb) = callback {
-              cb(result.unwrap_or_default());
-            }
-          }
-          Err(e) => log::warn!("[wry] pending evaluate_script failed: {}", e),
+        let result = handle.evaluate_script(js).await;
+        if let Err(e) = &result {
+          log::warn!("[wry] pending evaluate_script failed: {}", e);
+        }
+        // #194: the callback is invoked for both outcomes — an eval failure
+        // settles with the literal "null" instead of leaving the awaiting
+        // promise pending forever.
+        if let Some(cb) = callback {
+          cb(eval_callback_payload(&result));
         }
       }
       PendingOp::CreatePdf(path, config, callback) => {
@@ -330,6 +331,7 @@ impl InnerWebView {
       custom_protocols,
       background_color,
       transparent,
+      visible,
       headers,
       autoplay,
       user_agent,
@@ -511,6 +513,14 @@ impl InnerWebView {
       .collect();
     let shared_for_intercept = shared_protocols.clone();
 
+    // #199: pre-fill the URL cache with the (normalized) initial URL so the
+    // first IPC invoke that arrives before navigation completes resolves
+    // against the real page URL instead of the about:blank fallback. `url()`
+    // shares this cache — before navigation it now returns the initial URL
+    // rather than an empty string (benign, more truthful).
+    *url_cache.lock().unwrap() =
+      url_cache_prefill(initial_url.as_deref(), use_https, &shared_for_intercept);
+
     // Register https intercept callback (if use_https and protocols exist)
     if use_https && !shared_for_intercept.is_empty() {
       let https_id = id.clone();
@@ -676,6 +686,10 @@ impl InnerWebView {
     let mut create_req = WebviewCreateRequest::new(&id)
       .style(WebviewStyle {
         background_color: bg_color_str,
+        // #188: forward the requested visibility through the existing
+        // `WebviewStyle.visible` wire field (zero NAPI change); the ArkTS
+        // receiver treats `true`/unset identically.
+        visible: Some(visible),
         ..Default::default()
       })
       .initialization_scripts(merged_scripts)
@@ -1407,6 +1421,28 @@ fn headers_to_btree(headers: &http::HeaderMap) -> std::collections::BTreeMap<Str
     .collect()
 }
 
+/// Formats an `OffsetDateTime` as an RFC 6265 §5.1.1 IMF-fixdate string in
+/// UTC (e.g. `Thu, 01 Jan 2026 00:00:00 GMT`). Note IMF-fixdate is NOT the
+/// same as RFC 2822 (`+0000` suffix etc.) — ArkWeb expects the fixed form.
+fn format_imf_fixdate(dt: cookie::time::OffsetDateTime) -> String {
+  use cookie::time::UtcOffset;
+  const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+  ];
+  let dt = dt.to_offset(UtcOffset::UTC);
+  format!(
+    "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+    WEEKDAYS[dt.weekday().number_days_from_monday() as usize],
+    dt.day(),
+    MONTHS[dt.month() as u8 as usize - 1],
+    dt.year(),
+    dt.hour(),
+    dt.minute(),
+    dt.second()
+  )
+}
+
 /// Format a `cookie::Cookie` as a Set-Cookie value string (RFC 6265).
 fn format_set_cookie_value(cookie: &Cookie<'_>) -> String {
   let mut value = format!("{}={}", cookie.name(), cookie.value());
@@ -1415,6 +1451,16 @@ fn format_set_cookie_value(cookie: &Cookie<'_>) -> String {
   }
   if let Some(p) = cookie.path() {
     value.push_str(&format!("; Path={}", p));
+  }
+  // Persistence attributes (#190①): emit Expires (IMF-fixdate) and Max-Age so
+  // a persistent cookie does not degrade to a session cookie in ArkWeb. When
+  // both are present RFC 6265 §5.3 prefers Max-Age — both are emitted here and
+  // the receiving system applies the precedence. Session cookies carry neither.
+  if let Some(cookie::Expiration::DateTime(dt)) = cookie.expires() {
+    value.push_str(&format!("; Expires={}", format_imf_fixdate(dt)));
+  }
+  if let Some(max_age) = cookie.max_age() {
+    value.push_str(&format!("; Max-Age={}", max_age.whole_seconds()));
   }
   if cookie.secure().unwrap_or(false) {
     value.push_str("; Secure");
@@ -1426,6 +1472,35 @@ fn format_set_cookie_value(cookie: &Cookie<'_>) -> String {
     value.push_str(&format!("; SameSite={}", same_site));
   }
   value
+}
+
+/// Resolves the eval-callback payload for an evaluation outcome (#194).
+/// Success keeps the existing semantics (result text; `None` → empty), while
+/// a failure yields the literal `"null"` so the awaiting promise settles
+/// instead of hanging forever.
+fn eval_callback_payload<E>(result: &std::result::Result<Option<String>, E>) -> String {
+  match result {
+    Ok(Some(s)) => s.clone(),
+    Ok(None) => String::new(),
+    Err(_) => "null".to_string(),
+  }
+}
+
+/// Resolves the initial value of the URL cache for a created webview (#199):
+/// the normalized initial URL (same https-rewrite the create request applies)
+/// or an empty string when the webview is created from HTML with no URL.
+fn url_cache_prefill(
+  initial_url: Option<&str>,
+  use_https: bool,
+  protocols: &HashMap<String, SharedProtocolHandler>,
+) -> String {
+  match initial_url {
+    Some(url) if use_https && !protocols.is_empty() => {
+      rewrite_https_url_if_matching(url, protocols)
+    }
+    Some(url) => url.to_string(),
+    None => String::new(),
+  }
 }
 
 /// Parses the raw `fetchCookieSync` string (`"k=v; k2=v2"`) into owned cookies.
@@ -1471,6 +1546,134 @@ mod tests {
   fn format_set_cookie_value_minimal() {
     let cookie = Cookie::build(("k", "v")).build();
     assert_eq!(format_set_cookie_value(&cookie), "k=v");
+  }
+
+  // #190①: persistence attributes survive the Set-Cookie formatting so a
+  // persistent cookie does not degrade to a session cookie in ArkWeb.
+
+  /// UT for #190①: an expiration datetime is emitted as an IMF-fixdate
+  /// `Expires` in UTC (RFC 6265 §5.1.1), e.g. `Thu, 01 Jan 2026 00:00:00 GMT`.
+  /// # Brief: build a cookie with a fixed expiry and assert the formatted
+  /// attribute verbatim.
+  #[test]
+  fn format_set_cookie_value_persistent_keeps_imf_fixdate_expires() {
+    let dt = cookie::time::OffsetDateTime::new_utc(
+      cookie::time::Date::from_calendar_date(2026, cookie::time::Month::January, 1)
+        .unwrap(),
+      cookie::time::Time::MIDNIGHT,
+    );
+    let cookie = Cookie::build(("token", "abc")).expires(dt).build();
+    let v = format_set_cookie_value(&cookie);
+    assert!(
+      v.contains("; Expires=Thu, 01 Jan 2026 00:00:00 GMT"),
+      "IMF-fixdate Expires missing or malformed: {v}"
+    );
+  }
+
+  /// UT for #190①: a max-age duration is emitted as whole-second `Max-Age`.
+  /// # Brief: build a cookie with max_age 3600s and assert `Max-Age=3600`.
+  #[test]
+  fn format_set_cookie_value_max_age_whole_seconds() {
+    let cookie = Cookie::build(("k", "v"))
+      .max_age(cookie::time::Duration::seconds(3600))
+      .build();
+    let v = format_set_cookie_value(&cookie);
+    assert!(v.contains("; Max-Age=3600"), "Max-Age missing: {v}");
+    // Expiration came only from max_age — no `Expires` must be invented.
+    assert!(!v.contains("Expires="), "unexpected Expires: {v}");
+  }
+
+  /// UT for #190①: a session cookie carries neither persistence attribute.
+  /// # Brief: build a bare cookie and assert both attributes are absent.
+  #[test]
+  fn format_set_cookie_value_session_omits_both_attributes() {
+    let cookie = Cookie::build(("k", "v")).build();
+    let v = format_set_cookie_value(&cookie);
+    assert!(!v.contains("Expires="), "session cookie gained Expires: {v}");
+    assert!(!v.contains("Max-Age="), "session cookie gained Max-Age: {v}");
+  }
+
+  /// UT for #190①: when both attributes are present both are emitted (the
+  /// RFC 6265 §5.3 Max-Age precedence is the receiving side's semantics).
+  /// # Brief: build a cookie with expiry + max-age and assert both appear.
+  #[test]
+  fn format_set_cookie_value_emits_both_when_both_given() {
+    let dt = cookie::time::OffsetDateTime::new_utc(
+      cookie::time::Date::from_calendar_date(2026, cookie::time::Month::January, 1)
+        .unwrap(),
+      cookie::time::Time::MIDNIGHT,
+    );
+    let cookie = Cookie::build(("k", "v"))
+      .expires(dt)
+      .max_age(cookie::time::Duration::seconds(60))
+      .build();
+    let v = format_set_cookie_value(&cookie);
+    assert!(
+      v.contains("; Expires=Thu, 01 Jan 2026 00:00:00 GMT"),
+      "Expires missing: {v}"
+    );
+    assert!(v.contains("; Max-Age=60"), "Max-Age missing: {v}");
+  }
+
+  // #194: eval failures settle the awaiting callback with the literal "null".
+
+  /// UT for #194: a failed evaluation maps to the `"null"` callback payload so
+  /// the pending promise settles instead of hanging.
+  /// # Brief: feed an `Err` outcome to the payload helper and assert `"null"`.
+  #[test]
+  fn eval_callback_payload_failure_is_null() {
+    let err = crate::Error::OpenHarmonyInitError("bridge gone".into());
+    assert_eq!(eval_callback_payload(&Err(err)), "null");
+  }
+
+  /// UT for #194: successful evaluations keep the existing payload semantics
+  /// (result passed through, `None` → empty string).
+  /// # Brief: feed `Ok` outcomes to the payload helper and assert both shapes.
+  #[test]
+  fn eval_callback_payload_success_passthrough() {
+    let ok_some: std::result::Result<Option<String>, crate::Error> =
+      Ok(Some("42".to_string()));
+    let ok_none: std::result::Result<Option<String>, crate::Error> = Ok(None);
+    assert_eq!(eval_callback_payload(&ok_some), "42");
+    assert_eq!(eval_callback_payload(&ok_none), "");
+  }
+
+  // #199: the URL cache is pre-filled with the (normalized) initial URL.
+
+  /// UT for #199: a creation URL lands in the cache verbatim when no https
+  /// rewrite applies, so the first IPC invoke resolves the real URL.
+  /// # Brief: call the prefill helper with a URL and no protocols.
+  #[test]
+  fn url_cache_prefill_uses_initial_url() {
+    let empty: HashMap<String, SharedProtocolHandler> = HashMap::new();
+    assert_eq!(
+      url_cache_prefill(Some("https://example.com/app"), false, &empty),
+      "https://example.com/app"
+    );
+  }
+
+  /// UT for #199: HTML-created webviews (no URL) keep the empty cache so the
+  /// existing about:blank fallback stays in effect.
+  /// # Brief: call the prefill helper with `None`.
+  #[test]
+  fn url_cache_prefill_empty_without_url() {
+    let empty: HashMap<String, SharedProtocolHandler> = HashMap::new();
+    assert_eq!(url_cache_prefill(None, false, &empty), "");
+  }
+
+  /// UT for #199: the prefill applies the same https-scheme rewrite the
+  /// create request applies, so cache and request agree.
+  /// # Brief: register the "tauri" protocol and assert the rewritten form.
+  #[test]
+  fn url_cache_prefill_applies_https_rewrite() {
+    let dummy: SharedProtocolHandler =
+      Arc::new(SendSyncBox(Box::new(|_id, _req, _responder| {})));
+    let mut protocols: HashMap<String, SharedProtocolHandler> = HashMap::new();
+    protocols.insert("tauri".to_string(), dummy);
+    assert_eq!(
+      url_cache_prefill(Some("tauri://localhost/index.html"), true, &protocols),
+      "https://tauri.localhost/index.html"
+    );
   }
 
   // This module is gated on `target_env = "ohos"`: these tests only run in

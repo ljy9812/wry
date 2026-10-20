@@ -972,8 +972,9 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// ## Platform-specific:
   ///
-  /// - **OpenHarmony**: Ignored — the webview is always created visible. Use
-  ///   [`WebView::set_visible`] after creation to hide it.
+  /// - **OpenHarmony**: Forwarded as `style.visible` in the creation payload
+  ///   (#188); the webview honors it at creation time. Use
+  ///   [`WebView::set_visible`] to change visibility after creation.
   pub fn with_visible(mut self, visible: bool) -> Self {
     self.attrs.visible = visible;
     self
@@ -2299,6 +2300,15 @@ impl WebView {
   }
 
   /// Clear all browsing data
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **OpenHarmony**: additionally clears the webview's non-incognito cookie
+  ///   store (persistent and session cookies) via
+  ///   `WebCookieManager.clearAllCookiesSync(false)` before the browsing-data
+  ///   cleanup (#191; availability-guarded, a missing/throwing API only warns).
+  ///   Not cleared: SSL cache and clientAuthCache — the SDK exposes no public
+  ///   API for them.
   pub fn clear_all_browsing_data(&self) -> Result<()> {
     self.webview.clear_all_browsing_data()
   }
