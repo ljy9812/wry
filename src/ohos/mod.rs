@@ -60,13 +60,16 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
 /// NaN. Desktop baseline reports vp = 1.0 → division is an identity (319-case
 /// desktop suite and UT numbers stay bit-identical); a vp ≠ 1 device divides
 /// physical px by vp to land in ArkUI vp units.
-pub(crate) fn virtual_pixel_ratio() -> f64 {
-  let vp = openharmony_ability::virtual_pixel_ratio() as f64;
+pub(crate) fn vp_ratio_sanitized(vp: f64) -> f64 {
   if vp.is_finite() && vp > 0.0 {
     vp
   } else {
     1.0
   }
+}
+
+pub(crate) fn virtual_pixel_ratio() -> f64 {
+  vp_ratio_sanitized(openharmony_ability::virtual_pixel_ratio() as f64)
 }
 
 /// #198: the physical→ArkUI-vp conversion applied to webview geometry
@@ -1656,10 +1659,13 @@ fn dispatch_https_intercept_sync(
         if name.as_str().eq_ignore_ascii_case("content-type") {
           continue;
         }
-        let (Ok(name_str), Ok(value_str)) = (name.to_str(), value.to_str()) else {
+        // HeaderName is ASCII by construction (http crate) — only the value
+        // can carry non-UTF-8/opaque bytes. Mirrors the request-side
+        // extraction at the wire build site below.
+        let name_str = name.as_str();
+        let Ok(value_str) = value.to_str() else {
           log::debug!(
-            "[wry https-intercept] skipping non-UTF8 response header '{:?}'",
-            name
+            "[wry https-intercept] skipping non-UTF8 response header '{name_str}'"
           );
           continue;
         };
@@ -2386,12 +2392,25 @@ mod tests {
     );
   }
 
-  /// UT for #198: the wry-side ratio wrapper is total on the host — the
-  /// ability binding's ≤0/absent fallback (1.0) plus this side's non-finite
-  /// guard mean the value is exactly 1.0 and set_bounds never divides by 0.
+  /// UT for #198: the wrapper's sanitize guard is deterministic — ≤0, NaN and
+  /// ±inf fall back to exactly 1.0 (never a division hazard), real ratios pass
+  /// through untouched. The LIVE binding value is device-real (1.9 on the
+  /// desktop reference device), so the fallback contract is pinned on the pure
+  /// guard, not on the environment.
   #[test]
-  fn ut_vp_ratio_host_falls_back_to_one() {
-    assert_eq!(virtual_pixel_ratio(), 1.0);
+  fn ut_vp_ratio_guard_falls_back_to_one() {
+    assert_eq!(vp_ratio_sanitized(f64::NAN), 1.0);
+    assert_eq!(vp_ratio_sanitized(f64::INFINITY), 1.0);
+    assert_eq!(vp_ratio_sanitized(f64::NEG_INFINITY), 1.0);
+    assert_eq!(vp_ratio_sanitized(0.0), 1.0);
+    assert_eq!(vp_ratio_sanitized(-1.5), 1.0);
+    assert_eq!(vp_ratio_sanitized(1.0), 1.0);
+    assert_eq!(vp_ratio_sanitized(1.9), 1.9);
+    assert_eq!(vp_ratio_sanitized(2.5), 2.5);
+    // Totality of the live wrapper: whatever the binding reports on this
+    // environment, the widened value is always finite and positive.
+    let vp = virtual_pixel_ratio();
+    assert!(vp.is_finite() && vp > 0.0, "live vp ratio must stay total, got {vp}");
   }
 
   // #192 (design D4): the url() three-state router.
@@ -2437,7 +2456,10 @@ mod tests {
     assert!(devtools_open_intent(), "first open must dispatch");
     assert!(!devtools_open_intent(), "repeat open must be idempotent");
     assert!(!devtools_open_intent(), "third open must still be idempotent");
-    assert!(!devtools_close_intent(), "close reports the applied open");
+    // Close returns the pre-swap flag: an applied/queued open is consumed, so
+    // the FIRST close reports true (mirrors open's "flipped = dispatch owed").
+    assert!(devtools_close_intent(), "close consumes the applied open");
+    assert!(!devtools_close_intent(), "repeat close after consumption is a no-op");
     assert!(devtools_open_intent(), "open after close must dispatch again");
     DEVTOOLS_ENABLED.store(saved, Ordering::SeqCst);
   }
