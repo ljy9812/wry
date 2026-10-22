@@ -107,9 +107,7 @@ fn dispose_once(disposed: &AtomicBool) -> bool {
 fn refresh_url_cache_from_bridge(webview_id: &str, cache: &Mutex<String>) {
   match openharmony_ability_plugin_webview::webview_url_on_main_thread(webview_id) {
     Ok(url) => *cache.lock().unwrap() = url,
-    Err(e) => log::debug!(
-      "[wry] url(): main-thread sync bridge failed, keeping cached url: {e}"
-    ),
+    Err(e) => log::debug!("[wry] url(): main-thread sync bridge failed, keeping cached url: {e}"),
   }
 }
 
@@ -211,9 +209,7 @@ impl BridgeExecutor {
     // webview on a worker, which was then misrecorded as main forever
     // (issue #145).
     static SHARED: OnceLock<BridgeExecutor> = OnceLock::new();
-    SHARED
-      .get_or_init(|| Self::new_exclusive())
-      .clone()
+    SHARED.get_or_init(|| Self::new_exclusive()).clone()
   }
 
   fn new_exclusive() -> Self {
@@ -256,7 +252,11 @@ enum PendingOp {
   SetCookie(String, String),
   Print(String),
   Eval(String, Option<Box<dyn Fn(String) + Send + 'static>>),
-  CreatePdf(String, Option<WebviewPdfConfig>, Option<Box<dyn Fn(bool) + Send + 'static>>),
+  CreatePdf(
+    String,
+    Option<WebviewPdfConfig>,
+    Option<Box<dyn Fn(bool) + Send + 'static>>,
+  ),
   Remove,
   /// #195: queued open_devtools — `setWebDebuggingAccess(true)` issued while
   /// create was still pending, replayed by the create drain once the handshake
@@ -573,9 +573,7 @@ impl InnerWebView {
     // Navigation handler: wry semantics true=allow → bridge intercept=true means block
     if let Some(navigation_handler) = navigation_handler {
       let handler = Arc::new(SendSyncBox(navigation_handler));
-      callbacks_builder = callbacks_builder.on_navigation_request(move |req| {
-        !(handler.0)(req.url)
-      });
+      callbacks_builder = callbacks_builder.on_navigation_request(move |req| !(handler.0)(req.url));
     }
 
     // Title change handler
@@ -606,11 +604,7 @@ impl InnerWebView {
     if let Some(download_completed_handler) = download_completed_handler {
       let handler = Arc::new(SendSyncBox(download_completed_handler));
       callbacks_builder = callbacks_builder.on_download_end(move |event| {
-        (handler.0)(
-          event.url,
-          event.temp_path.map(PathBuf::from),
-          event.success,
-        );
+        (handler.0)(event.url, event.temp_path.map(PathBuf::from), event.success);
       });
     }
 
@@ -712,20 +706,19 @@ impl InnerWebView {
     if use_https && !shared_for_intercept.is_empty() {
       let https_id = id.clone();
       let https_protocols = shared_for_intercept.clone();
-      callbacks_builder =
-        callbacks_builder.on_https_intercept_request(move |req| {
-          // #186: forward the intercepted request's method + parallel header
-          // arrays when the ArkTS plugin sent them (None on older plugins —
-          // the builder then keeps the historical GET/no-headers shape).
-          dispatch_https_intercept_sync(
-            &req.url,
-            &https_id,
-            &https_protocols,
-            req.method.as_deref(),
-            req.header_names.as_deref(),
-            req.header_values.as_deref(),
-          )
-        });
+      callbacks_builder = callbacks_builder.on_https_intercept_request(move |req| {
+        // #186: forward the intercepted request's method + parallel header
+        // arrays when the ArkTS plugin sent them (None on older plugins —
+        // the builder then keeps the historical GET/no-headers shape).
+        dispatch_https_intercept_sync(
+          &req.url,
+          &https_id,
+          &https_protocols,
+          req.method.as_deref(),
+          req.header_names.as_deref(),
+          req.header_values.as_deref(),
+        )
+      });
     }
 
     callbacks_builder
@@ -790,17 +783,23 @@ impl InnerWebView {
       let protocol = protocol.clone();
       let callback = Arc::clone(callback);
       client
-        .custom_protocol_async(webview_id.clone(), &protocol, move |_url, req, _is_main, responder| {
-          let responder_box: Box<dyn FnOnce(Response<Cow<'static, [u8]>>)> =
-            Box::new(move |resp| {
-              responder.respond(resp);
-            });
-          (callback.0)(
-            webview_id.as_str(),
-            req,
-            RequestAsyncResponder { responder: responder_box },
-          );
-        })
+        .custom_protocol_async(
+          webview_id.clone(),
+          &protocol,
+          move |_url, req, _is_main, responder| {
+            let responder_box: Box<dyn FnOnce(Response<Cow<'static, [u8]>>)> =
+              Box::new(move |resp| {
+                responder.respond(resp);
+              });
+            (callback.0)(
+              webview_id.as_str(),
+              req,
+              RequestAsyncResponder {
+                responder: responder_box,
+              },
+            );
+          },
+        )
         .map_err(|e| {
           Error::OpenHarmonyInitError(format!("Failed to register custom protocol: {}", e))
         })?;
@@ -865,20 +864,19 @@ impl InnerWebView {
     // into one HTML document in order. (OHOS `ScriptItem` carries only `script`
     // + `scriptRules` — `for_main_frame_only` is already dropped on this path —
     // so a single blob loses no behavior OHOS currently honors.)
-    let merged_scripts: Vec<WebviewInitializationScript> =
-      if initialization_scripts.is_empty() {
-        Vec::new()
-      } else {
-        let body = initialization_scripts
-          .iter()
-          .map(|s| s.script.as_str())
-          .collect::<Vec<_>>()
-          .join(";\n");
-        vec![WebviewInitializationScript {
-          script: body,
-          script_rules,
-        }]
-      };
+    let merged_scripts: Vec<WebviewInitializationScript> = if initialization_scripts.is_empty() {
+      Vec::new()
+    } else {
+      let body = initialization_scripts
+        .iter()
+        .map(|s| s.script.as_str())
+        .collect::<Vec<_>>()
+        .join(";\n");
+      vec![WebviewInitializationScript {
+        script: body,
+        script_rules,
+      }]
+    };
 
     let mut create_req = WebviewCreateRequest::new(&id)
       .style(WebviewStyle {
@@ -906,7 +904,13 @@ impl InnerWebView {
     } else if let Some(url) = initial_url {
       let url = if use_https && !shared_for_intercept.is_empty() {
         let rewritten = rewrite_https_url_if_matching(&url, &shared_for_intercept);
-        log::info!("[wry https-intercept] URL rewrite: {} → {} (use_https={}, protocols={:?})", url, rewritten, use_https, shared_for_intercept.keys().collect::<Vec<_>>());
+        log::info!(
+          "[wry https-intercept] URL rewrite: {} → {} (use_https={}, protocols={:?})",
+          url,
+          rewritten,
+          use_https,
+          shared_for_intercept.keys().collect::<Vec<_>>()
+        );
         rewritten
       } else {
         url
@@ -1016,9 +1020,7 @@ impl InnerWebView {
           // on every failed create. Process-wide scheme declarations are
           // intentionally kept (shared across webviews, idempotent).
           drop(guard);
-          if let Err(rollback_err) =
-            client_for_create.rollback_registrations(&id_for_rollback)
-          {
+          if let Err(rollback_err) = client_for_create.rollback_registrations(&id_for_rollback) {
             log::warn!(
               "[wry] rollback of registry entries for failed create '{}' failed: {}",
               id_for_rollback,
@@ -1115,11 +1117,7 @@ impl InnerWebView {
   }
 
   // Pattern B: callback — spawn + async trigger callback
-  pub fn eval(
-    &self,
-    js: &str,
-    callback: Option<impl Fn(String) + Send + 'static>,
-  ) -> Result<()> {
+  pub fn eval(&self, js: &str, callback: Option<impl Fn(String) + Send + 'static>) -> Result<()> {
     let js = js.to_string();
     let cb = callback.map(|c| Box::new(c) as Box<dyn Fn(String) + Send + 'static>);
     self.dispatch_or_queue(PendingOp::Eval(js, cb))?;
@@ -1304,10 +1302,7 @@ impl InnerWebView {
 
   pub fn load_url_with_headers(&self, url: &str, headers: http::HeaderMap) -> Result<()> {
     let header_map = headers_to_btree(&headers);
-    self.dispatch_or_queue(PendingOp::LoadUrlWithHeaders(
-      url.to_string(),
-      header_map,
-    ))?;
+    self.dispatch_or_queue(PendingOp::LoadUrlWithHeaders(url.to_string(), header_map))?;
     Ok(())
   }
 
@@ -1346,7 +1341,11 @@ impl InnerWebView {
       scale: c.scale,
       should_print_background: c.should_print_background,
     });
-    self.dispatch_or_queue(PendingOp::CreatePdf(path.to_string(), pdf_config, Some(callback)))?;
+    self.dispatch_or_queue(PendingOp::CreatePdf(
+      path.to_string(),
+      pdf_config,
+      Some(callback),
+    ))?;
     Ok(())
   }
 
@@ -1537,7 +1536,11 @@ fn dispatch_https_intercept_sync(
   header_names: Option<&[String]>,
   header_values: Option<&[String]>,
 ) -> WebviewHttpsInterceptResponse {
-  log::debug!("[wry https-intercept] enter: url={} webview_id={}", url, webview_id);
+  log::debug!(
+    "[wry https-intercept] enter: url={} webview_id={}",
+    url,
+    webview_id
+  );
 
   // Match a registered protocol with the upstream workaround matcher
   // (`{scheme}://{protocol}.` prefix — host-agnostic). Only registered
@@ -1573,13 +1576,11 @@ fn dispatch_https_intercept_sync(
 
   // #186: rebuild the intercepted request's method + headers when the ArkTS
   // interceptor supplied them. Defaults preserve the old wire shape.
-  let parsed_method = method.and_then(|m| {
-    match http::Method::from_bytes(m.as_bytes()) {
-      Ok(m) => Some(m),
-      Err(_) => {
-        log::debug!("[wry https-intercept] invalid method '{m}', falling back to GET");
-        None
-      }
+  let parsed_method = method.and_then(|m| match http::Method::from_bytes(m.as_bytes()) {
+    Ok(m) => Some(m),
+    Err(_) => {
+      log::debug!("[wry https-intercept] invalid method '{m}', falling back to GET");
+      None
     }
   });
   let mut builder = Request::builder().uri(&original_url);
@@ -1601,7 +1602,11 @@ fn dispatch_https_intercept_sync(
   let request = match builder.body(Vec::new()) {
     Ok(r) => r,
     Err(e) => {
-      log::warn!("[wry https-intercept] passthrough: failed to build request for {}: {}", original_url, e);
+      log::warn!(
+        "[wry https-intercept] passthrough: failed to build request for {}: {}",
+        original_url,
+        e
+      );
       return WebviewHttpsInterceptResponse::passthrough();
     }
   };
@@ -1609,8 +1614,7 @@ fn dispatch_https_intercept_sync(
   // Non-blocking response cell: the handler is expected to call the responder
   // synchronously (before returning). We check immediately after the call — no
   // recv_timeout, no main-thread blocking.
-  let response_cell: Arc<Mutex<Option<Response<Cow<'static, [u8]>>>>> =
-    Arc::new(Mutex::new(None));
+  let response_cell: Arc<Mutex<Option<Response<Cow<'static, [u8]>>>>> = Arc::new(Mutex::new(None));
   let response_cell_clone = Arc::clone(&response_cell);
 
   let responder: Box<dyn FnOnce(Response<Cow<'static, [u8]>>)> = Box::new(move |resp| {
@@ -1621,11 +1625,7 @@ fn dispatch_https_intercept_sync(
     "[wry https-intercept] calling protocol handler for protocol='{}'...",
     protocol
   );
-  (callback.0)(
-    webview_id,
-    request,
-    RequestAsyncResponder { responder },
-  );
+  (callback.0)(webview_id, request, RequestAsyncResponder { responder });
   log::debug!(
     "[wry https-intercept] protocol handler returned for protocol='{}'",
     protocol
@@ -1664,9 +1664,7 @@ fn dispatch_https_intercept_sync(
         // extraction at the wire build site below.
         let name_str = name.as_str();
         let Ok(value_str) = value.to_str() else {
-          log::debug!(
-            "[wry https-intercept] skipping non-UTF8 response header '{name_str}'"
-          );
+          log::debug!("[wry https-intercept] skipping non-UTF8 response header '{name_str}'");
           continue;
         };
         header_names.push(name_str.to_string());
@@ -1717,7 +1715,10 @@ fn custom_protocols_use_https(protocols: &HashMap<String, SharedProtocolHandler>
 
 /// Rewrite `<protocol>://localhost/<path>` to `https://<protocol>.localhost/<path>`
 /// when the URL's scheme matches one of `custom_protocols`' keys.
-fn rewrite_https_url_if_matching(url: &str, custom_protocols: &HashMap<String, SharedProtocolHandler>) -> String {
+fn rewrite_https_url_if_matching(
+  url: &str,
+  custom_protocols: &HashMap<String, SharedProtocolHandler>,
+) -> String {
   for protocol in custom_protocols.keys() {
     let original_prefix = format!("{}://", protocol);
     if url.starts_with(&original_prefix) {
@@ -1881,8 +1882,7 @@ mod tests {
   #[test]
   fn format_set_cookie_value_persistent_keeps_imf_fixdate_expires() {
     let dt = cookie::time::OffsetDateTime::new_utc(
-      cookie::time::Date::from_calendar_date(2026, cookie::time::Month::January, 1)
-        .unwrap(),
+      cookie::time::Date::from_calendar_date(2026, cookie::time::Month::January, 1).unwrap(),
       cookie::time::Time::MIDNIGHT,
     );
     let cookie = Cookie::build(("token", "abc")).expires(dt).build();
@@ -1912,8 +1912,14 @@ mod tests {
   fn format_set_cookie_value_session_omits_both_attributes() {
     let cookie = Cookie::build(("k", "v")).build();
     let v = format_set_cookie_value(&cookie);
-    assert!(!v.contains("Expires="), "session cookie gained Expires: {v}");
-    assert!(!v.contains("Max-Age="), "session cookie gained Max-Age: {v}");
+    assert!(
+      !v.contains("Expires="),
+      "session cookie gained Expires: {v}"
+    );
+    assert!(
+      !v.contains("Max-Age="),
+      "session cookie gained Max-Age: {v}"
+    );
   }
 
   /// UT for #190①: when both attributes are present both are emitted (the
@@ -1922,8 +1928,7 @@ mod tests {
   #[test]
   fn format_set_cookie_value_emits_both_when_both_given() {
     let dt = cookie::time::OffsetDateTime::new_utc(
-      cookie::time::Date::from_calendar_date(2026, cookie::time::Month::January, 1)
-        .unwrap(),
+      cookie::time::Date::from_calendar_date(2026, cookie::time::Month::January, 1).unwrap(),
       cookie::time::Time::MIDNIGHT,
     );
     let cookie = Cookie::build(("k", "v"))
@@ -1954,8 +1959,7 @@ mod tests {
   /// # Brief: feed `Ok` outcomes to the payload helper and assert both shapes.
   #[test]
   fn eval_callback_payload_success_passthrough() {
-    let ok_some: std::result::Result<Option<String>, crate::Error> =
-      Ok(Some("42".to_string()));
+    let ok_some: std::result::Result<Option<String>, crate::Error> = Ok(Some("42".to_string()));
     let ok_none: std::result::Result<Option<String>, crate::Error> = Ok(None);
     assert_eq!(eval_callback_payload(&ok_some), "42");
     assert_eq!(eval_callback_payload(&ok_none), "");
@@ -1989,8 +1993,7 @@ mod tests {
   /// # Brief: register the "tauri" protocol and assert the rewritten form.
   #[test]
   fn url_cache_prefill_applies_https_rewrite() {
-    let dummy: SharedProtocolHandler =
-      Arc::new(SendSyncBox(Box::new(|_id, _req, _responder| {})));
+    let dummy: SharedProtocolHandler = Arc::new(SendSyncBox(Box::new(|_id, _req, _responder| {})));
     let mut protocols: HashMap<String, SharedProtocolHandler> = HashMap::new();
     protocols.insert("tauri".to_string(), dummy);
     assert_eq!(
@@ -2074,9 +2077,7 @@ mod tests {
   fn rewrite_https_url_matches_registered_protocol() {
     // When the URL scheme matches a registered protocol key, it should be
     // rewritten to https://{protocol}.localhost/...
-    let dummy: SharedProtocolHandler = Arc::new(SendSyncBox(Box::new(
-      |_id, _req, _responder| {},
-    )));
+    let dummy: SharedProtocolHandler = Arc::new(SendSyncBox(Box::new(|_id, _req, _responder| {})));
     let mut protocols: HashMap<String, SharedProtocolHandler> = HashMap::new();
     protocols.insert("tauri".to_string(), dummy);
 
@@ -2088,9 +2089,7 @@ mod tests {
   #[test]
   fn rewrite_https_url_no_match_external_url() {
     // External URLs should not be rewritten
-    let dummy: SharedProtocolHandler = Arc::new(SendSyncBox(Box::new(
-      |_id, _req, _responder| {},
-    )));
+    let dummy: SharedProtocolHandler = Arc::new(SendSyncBox(Box::new(|_id, _req, _responder| {})));
     let mut protocols: HashMap<String, SharedProtocolHandler> = HashMap::new();
     protocols.insert("tauri".to_string(), dummy);
 
@@ -2113,9 +2112,7 @@ mod tests {
     // If multiple protocols are registered, the URL is rewritten using
     // the first matching protocol key (HashMap iteration order is unspecified,
     // but only one protocol prefix can match any given URL).
-    let dummy: SharedProtocolHandler = Arc::new(SendSyncBox(Box::new(
-      |_id, _req, _responder| {},
-    )));
+    let dummy: SharedProtocolHandler = Arc::new(SendSyncBox(Box::new(|_id, _req, _responder| {})));
     let mut protocols: HashMap<String, SharedProtocolHandler> = HashMap::new();
     protocols.insert("tauri".to_string(), dummy.clone());
     protocols.insert("wry".to_string(), dummy);
@@ -2160,7 +2157,14 @@ mod tests {
     let mut protocols: HashMap<String, SharedProtocolHandler> = HashMap::new();
     protocols.insert("asset".into(), Arc::new(SendSyncBox(handler)));
 
-    let resp = dispatch_https_intercept_sync("https://asset.mydomain/x?y=1", "w1", &protocols, None, None, None);
+    let resp = dispatch_https_intercept_sync(
+      "https://asset.mydomain/x?y=1",
+      "w1",
+      &protocols,
+      None,
+      None,
+      None,
+    );
     assert!(resp.handled);
     assert_eq!(
       *seen.lock().unwrap(),
@@ -2170,9 +2174,7 @@ mod tests {
 
   #[test]
   fn format_set_cookie_value_with_path_only() {
-    let cookie = Cookie::build(("session", "xyz"))
-      .path("/app")
-      .build();
+    let cookie = Cookie::build(("session", "xyz")).path("/app").build();
     let v = format_set_cookie_value(&cookie);
     assert!(v.starts_with("session=xyz"));
     assert!(v.contains("; Path=/app"));
@@ -2223,7 +2225,14 @@ mod tests {
 
   #[test]
   fn https_intercept_non_https_url_passthrough() {
-    let resp = dispatch_https_intercept_sync("http://x.localhost/p", "w1", &HashMap::new(), None, None, None);
+    let resp = dispatch_https_intercept_sync(
+      "http://x.localhost/p",
+      "w1",
+      &HashMap::new(),
+      None,
+      None,
+      None,
+    );
     assert!(!resp.handled && resp.status == 0);
   }
 
@@ -2324,7 +2333,11 @@ mod tests {
       .header_values
       .as_deref()
       .expect("response header values must be forwarded on the wire");
-    assert_eq!(names.len(), values.len(), "parallel arrays must stay aligned");
+    assert_eq!(
+      names.len(),
+      values.len(),
+      "parallel arrays must stay aligned"
+    );
     assert!(
       !names.iter().any(|n| n.eq_ignore_ascii_case("content-type")),
       "content-type must not be duplicated into the header arrays"
@@ -2371,7 +2384,10 @@ mod tests {
       (200.0, 100.0)
     );
     let s = dpi::PhysicalSize::new(640_u32, 480);
-    assert_eq!(size_to_logical_vp(dpi::Size::Physical(s), 1.0), (640.0, 480.0));
+    assert_eq!(
+      size_to_logical_vp(dpi::Size::Physical(s), 1.0),
+      (640.0, 480.0)
+    );
   }
 
   /// UT for #198: vp = 2.0 halves Physical(200,100) → (100,50), while a
@@ -2384,7 +2400,10 @@ mod tests {
       (100.0, 50.0)
     );
     let s = dpi::PhysicalSize::new(200_u32, 100);
-    assert_eq!(size_to_logical_vp(dpi::Size::Physical(s), 2.0), (100.0, 50.0));
+    assert_eq!(
+      size_to_logical_vp(dpi::Size::Physical(s), 2.0),
+      (100.0, 50.0)
+    );
     let l = dpi::LogicalPosition::new(30.0_f64, 40.0);
     assert_eq!(
       geometry_to_logical_vp(dpi::Position::Logical(l), 2.0),
@@ -2410,7 +2429,10 @@ mod tests {
     // Totality of the live wrapper: whatever the binding reports on this
     // environment, the widened value is always finite and positive.
     let vp = virtual_pixel_ratio();
-    assert!(vp.is_finite() && vp > 0.0, "live vp ratio must stay total, got {vp}");
+    assert!(
+      vp.is_finite() && vp > 0.0,
+      "live vp ratio must stay total, got {vp}"
+    );
   }
 
   // #192 (design D4): the url() three-state router.
@@ -2455,12 +2477,21 @@ mod tests {
     DEVTOOLS_ENABLED.store(false, Ordering::SeqCst);
     assert!(devtools_open_intent(), "first open must dispatch");
     assert!(!devtools_open_intent(), "repeat open must be idempotent");
-    assert!(!devtools_open_intent(), "third open must still be idempotent");
+    assert!(
+      !devtools_open_intent(),
+      "third open must still be idempotent"
+    );
     // Close returns the pre-swap flag: an applied/queued open is consumed, so
     // the FIRST close reports true (mirrors open's "flipped = dispatch owed").
     assert!(devtools_close_intent(), "close consumes the applied open");
-    assert!(!devtools_close_intent(), "repeat close after consumption is a no-op");
-    assert!(devtools_open_intent(), "open after close must dispatch again");
+    assert!(
+      !devtools_close_intent(),
+      "repeat close after consumption is a no-op"
+    );
+    assert!(
+      devtools_open_intent(),
+      "open after close must dispatch again"
+    );
     DEVTOOLS_ENABLED.store(saved, Ordering::SeqCst);
   }
 
@@ -2478,10 +2509,22 @@ mod tests {
     let runtime = BridgeExecutor::new();
 
     // Pre-handshake: both ops land in the production queue, order preserved.
-    dispatch_or_queue_op(&queue, &handle, &creation_error, &runtime, PendingOp::SetDevtools)
-      .expect("pre-handshake op must queue");
-    dispatch_or_queue_op(&queue, &handle, &creation_error, &runtime, PendingOp::Reload)
-      .expect("pre-handshake op must queue");
+    dispatch_or_queue_op(
+      &queue,
+      &handle,
+      &creation_error,
+      &runtime,
+      PendingOp::SetDevtools,
+    )
+    .expect("pre-handshake op must queue");
+    dispatch_or_queue_op(
+      &queue,
+      &handle,
+      &creation_error,
+      &runtime,
+      PendingOp::Reload,
+    )
+    .expect("pre-handshake op must queue");
     {
       let guard = queue.lock().unwrap();
       assert_eq!(guard.len(), 2, "both ops must sit in the production queue");
@@ -2495,7 +2538,14 @@ mod tests {
     // of accepting ops that would never be replayed.
     *creation_error.lock().unwrap() = Some("injected create failure".to_string());
     assert!(
-      dispatch_or_queue_op(&queue, &handle, &creation_error, &runtime, PendingOp::Reload).is_err(),
+      dispatch_or_queue_op(
+        &queue,
+        &handle,
+        &creation_error,
+        &runtime,
+        PendingOp::Reload
+      )
+      .is_err(),
       "ops after a failed create must surface the creation error"
     );
 
@@ -2503,7 +2553,10 @@ mod tests {
     // drain collects exactly the queued ops and leaves the queue empty.
     let drained: Vec<PendingOp> = queue.lock().unwrap().drain(..).collect();
     assert_eq!(drained.len(), 2, "drain must collect the queued ops");
-    assert!(queue.lock().unwrap().is_empty(), "drain must empty the queue");
+    assert!(
+      queue.lock().unwrap().is_empty(),
+      "drain must empty the queue"
+    );
   }
 
   /// UT for #195 + fix-variant m5: a queued open that can never replay (failed
@@ -2520,7 +2573,10 @@ mod tests {
 
     let mut queue: Vec<PendingOp> = vec![PendingOp::SetDevtools, PendingOp::Reload];
     failed_create_cleanup(&mut queue);
-    assert!(queue.is_empty(), "cleanup must drop the never-replayable ops");
+    assert!(
+      queue.is_empty(),
+      "cleanup must drop the never-replayable ops"
+    );
     assert!(
       devtools_open_intent(),
       "after the cleanup released the intent, a later open must dispatch again"
@@ -2537,9 +2593,15 @@ mod tests {
   #[test]
   fn ut_dispose_fence_fires_once_and_double_drop_is_noop() {
     let disposed = AtomicBool::new(false);
-    assert!(dispose_once(&disposed), "first dispose must dispatch Remove");
+    assert!(
+      dispose_once(&disposed),
+      "first dispose must dispatch Remove"
+    );
     assert!(!dispose_once(&disposed), "double dispose must be a no-op");
-    assert!(!dispose_once(&disposed), "triple dispose must still be a no-op");
+    assert!(
+      !dispose_once(&disposed),
+      "triple dispose must still be a no-op"
+    );
     assert!(disposed.load(Ordering::SeqCst));
   }
 
