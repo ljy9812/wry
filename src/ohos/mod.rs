@@ -429,6 +429,56 @@ pub(crate) struct InnerWebView {
   disposed: AtomicBool,
 }
 
+/// m5: failed-create cleanup — a queued `SetDevtools` can never replay once
+/// creation failed, so the process-level open intent must be released (a later
+/// webview's `open_devtools` dispatches again instead of silently no-oping).
+/// Ownership is exact: the queued open only exists when THIS webview flipped
+/// the intent (an earlier applied open makes `open_devtools` an early-return
+/// idempotent no-op, never a queue entry). Factored out of the create-failure
+/// closure so the host UT exercises the real cleanup.
+fn failed_create_cleanup(guard: &mut Vec<PendingOp>) {
+  #[cfg(any(debug_assertions, feature = "devtools"))]
+  if guard.iter().any(|op| matches!(op, PendingOp::SetDevtools)) {
+    devtools_close_intent();
+  }
+  // Queued ops can never execute — drop them.
+  guard.clear();
+}
+
+/// m4: the dispatch-or-queue decision + enqueue, factored out of the inherent
+/// method so the host UT exercises the REAL production path (queue /
+/// creation-failed / ready branches) instead of pushing into a scratch Vec.
+/// The parameters are exactly the `InnerWebView` fields the method touches —
+/// no test-only seam. **TOCTOU guard** (unchanged): the `pending_ops` lock must
+/// be held when checking `handle.get()` and when pushing the queued op.
+fn dispatch_or_queue_op(
+  pending_ops: &std::sync::Mutex<Vec<PendingOp>>,
+  handle: &OnceLock<WebviewHandle>,
+  creation_error: &std::sync::Mutex<Option<String>>,
+  runtime: &BridgeExecutor,
+  op: PendingOp,
+) -> Result<()> {
+  let mut guard = pending_ops.lock().unwrap();
+  if let Some(handle) = handle.get() {
+    // Handle is ready — release lock and spawn
+    let handle = handle.clone();
+    drop(guard);
+    runtime.spawn(async move {
+      op.execute(&handle).await;
+    });
+    Ok(())
+  } else if let Some(err) = creation_error.lock().unwrap().as_ref() {
+    Err(Error::OpenHarmonyWebviewError(format!(
+      "webview creation failed: {}",
+      err
+    )))
+  } else {
+    // Not ready — queue for replay after create
+    guard.push(op);
+    Ok(())
+  }
+}
+
 impl InnerWebView {
   pub(crate) fn new_as_child(
     window: &impl raw_window_handle::HasWindowHandle,
@@ -951,8 +1001,11 @@ impl InnerWebView {
           log::error!("[wry] WebviewClient::create() failed: {}", error_str);
           let mut guard = pending_ops_for_create.lock().unwrap();
           *creation_error_for_create.lock().unwrap() = Some(error_str);
-          // Queued ops can never execute — drop them.
-          guard.clear();
+          // m5: a queued `SetDevtools` can never replay after a failed create —
+          // release the process-level open intent so a later webview's
+          // `open_devtools` dispatches again instead of silently no-oping
+          // (see `failed_create_cleanup`).
+          failed_create_cleanup(&mut guard);
           // Roll back this attempt's entries from the process-global
           // registries (callbacks / ipc proxy / per-webview protocol
           // handlers). They were registered before the create was spawned
@@ -1011,25 +1064,13 @@ impl InnerWebView {
   /// Returns an error if webview creation already failed — the op is dropped
   /// rather than queued forever.
   fn dispatch_or_queue(&self, op: PendingOp) -> Result<()> {
-    let mut guard = self.pending_ops.lock().unwrap();
-    if let Some(handle) = self.handle.get() {
-      // Handle is ready — release lock and spawn
-      let handle = handle.clone();
-      drop(guard);
-      self.runtime.spawn(async move {
-        op.execute(&handle).await;
-      });
-      Ok(())
-    } else if let Some(err) = self.creation_error.lock().unwrap().as_ref() {
-      Err(Error::OpenHarmonyWebviewError(format!(
-        "webview creation failed: {}",
-        err
-      )))
-    } else {
-      // Not ready — queue for replay after create
-      guard.push(op);
-      Ok(())
-    }
+    dispatch_or_queue_op(
+      &self.pending_ops,
+      &self.handle,
+      &self.creation_error,
+      &self.runtime,
+      op,
+    )
   }
 
   /// Get the handle if ready, or None if create is still pending.
@@ -1603,15 +1644,45 @@ fn dispatch_https_intercept_sync(
         .unwrap_or("text/html")
         .to_string();
       let body = response.body().to_vec();
+      // #186 (fix-variant M1): forward the protocol handler's response headers
+      // to ArkTS (`WebResourceResponse.setResponseHeader`). Content-Type is
+      // carried by `mime_type` and never duplicated (double-application risk in
+      // ArkWeb); non-UTF-8 headers are skipped individually — the same
+      // degrade-safely rule as the request direction. An empty set stays `None`
+      // so headerless responses keep the pre-M1 wire shape (D9).
+      let mut header_names: Vec<String> = Vec::new();
+      let mut header_values: Vec<String> = Vec::new();
+      for (name, value) in response.headers().iter() {
+        if name.as_str().eq_ignore_ascii_case("content-type") {
+          continue;
+        }
+        let (Ok(name_str), Ok(value_str)) = (name.to_str(), value.to_str()) else {
+          log::debug!(
+            "[wry https-intercept] skipping non-UTF8 response header '{:?}'",
+            name
+          );
+          continue;
+        };
+        header_names.push(name_str.to_string());
+        header_values.push(value_str.to_string());
+      }
+      let (header_names, header_values) = if header_names.is_empty() {
+        (None, None)
+      } else {
+        (Some(header_names), Some(header_values))
+      };
       log::debug!(
-        "[wry https-intercept] success: protocol='{}' status={} mime={} body_len={}",
-        protocol, status, mime_type, body.len()
+        "[wry https-intercept] success: protocol='{}' status={} mime={} body_len={} resp_headers={}",
+        protocol, status, mime_type, body.len(),
+        header_names.as_ref().map(|n| n.len()).unwrap_or(0),
       );
       WebviewHttpsInterceptResponse {
         handled: true,
         status,
         mime_type,
         body,
+        header_names,
+        header_values,
       }
     }
     None => {
@@ -2210,6 +2281,74 @@ mod tests {
     assert!(start.elapsed() < std::time::Duration::from_secs(3));
   }
 
+  // ─── p3 fix-variant M1: response header write path (#186) ──────────────────
+
+  /// UT for #186 M1: the protocol handler's response headers reach the wire
+  /// struct as parallel arrays, with Content-Type excluded (it travels via
+  /// `mime_type`) and non-UTF-8 headers skipped individually.
+  #[test]
+  fn ut_intercept_response_headers_are_forwarded() {
+    let mut m: HashMap<String, SharedProtocolHandler> = HashMap::new();
+    let handler: ProtocolHandler = Box::new(|_id, _req, responder| {
+      let resp = http::Response::builder()
+        .status(200)
+        .header("content-type", "text/html")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("X-Tauri-Scheme-Echo", "p3-m1-ok")
+        .body(Vec::new())
+        .unwrap();
+      responder.respond(resp);
+    });
+    m.insert("myproto".into(), Arc::new(SendSyncBox(handler)));
+
+    let resp = dispatch_https_intercept_sync(
+      "https://myproto.localhost/header-probe",
+      "w1",
+      &m,
+      None,
+      None,
+      None,
+    );
+    assert!(resp.handled, "inline response must be handled");
+    let names = resp
+      .header_names
+      .as_deref()
+      .expect("response headers must be forwarded on the wire");
+    let values = resp
+      .header_values
+      .as_deref()
+      .expect("response header values must be forwarded on the wire");
+    assert_eq!(names.len(), values.len(), "parallel arrays must stay aligned");
+    assert!(
+      !names.iter().any(|n| n.eq_ignore_ascii_case("content-type")),
+      "content-type must not be duplicated into the header arrays"
+    );
+    let echo_idx = names
+      .iter()
+      .position(|n| n.eq_ignore_ascii_case("x-tauri-scheme-echo"))
+      .expect("the handler's custom header must survive the seam");
+    assert_eq!(values[echo_idx], "p3-m1-ok");
+  }
+
+  /// UT for #186 M1 + D9: a handler that only sets Content-Type keeps the old
+  /// wire shape — header arrays stay `None` (byte-identical default).
+  #[test]
+  fn ut_intercept_headerless_response_keeps_old_wire_shape() {
+    let resp = dispatch_https_intercept_sync(
+      "https://myproto.localhost/data",
+      "w1",
+      &https_test_handler("myproto", true),
+      None,
+      None,
+      None,
+    );
+    assert!(resp.handled);
+    assert!(
+      resp.header_names.is_none() && resp.header_values.is_none(),
+      "content-type-only responses must keep the pre-M1 wire shape (None headers)"
+    );
+  }
+
   // ─── p3 committer-issues batch: #189/#192/#195/#198 unit tests ─────────────
 
   // #198 (design D6): the vp conversion contract. Host baseline: the ability
@@ -2303,16 +2442,69 @@ mod tests {
     DEVTOOLS_ENABLED.store(saved, Ordering::SeqCst);
   }
 
-  /// UT for #195: the pre-handshake open lands in the pending-ops queue as
-  /// `SetDevtools` and the create drain replays queued ops in order (the
-  /// replay mechanism itself is device-verified on the delayed-attach path).
+  /// UT for #195 + fix-variant m4: the pre-handshake open goes through the REAL
+  /// `dispatch_or_queue_op` path (the exact production fn, not a scratch Vec) —
+  /// queued in order while the handle is unset, rejected after a failed create
+  /// (ops after failure must surface the error instead of queueing forever),
+  /// and the create drain (`guard.drain(..)`, the Ok-branch semantics) empties
+  /// the queue for replay.
   #[test]
-  fn ut_pending_op_queue_accepts_set_devtools_for_replay() {
-    let ops: Mutex<Vec<PendingOp>> = Mutex::new(Vec::new());
-    ops.lock().unwrap().push(PendingOp::SetDevtools);
-    ops.lock().unwrap().push(PendingOp::Reload);
-    ops.lock().unwrap().push(PendingOp::SetDevtools);
-    assert_eq!(ops.lock().unwrap().len(), 3, "queue must accept SetDevtools");
+  fn ut_dispatch_or_queue_set_devtools_real_path() {
+    let queue: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
+    let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let runtime = BridgeExecutor::new();
+
+    // Pre-handshake: both ops land in the production queue, order preserved.
+    dispatch_or_queue_op(&queue, &handle, &creation_error, &runtime, PendingOp::SetDevtools)
+      .expect("pre-handshake op must queue");
+    dispatch_or_queue_op(&queue, &handle, &creation_error, &runtime, PendingOp::Reload)
+      .expect("pre-handshake op must queue");
+    {
+      let guard = queue.lock().unwrap();
+      assert_eq!(guard.len(), 2, "both ops must sit in the production queue");
+      assert!(
+        matches!(guard[0], PendingOp::SetDevtools),
+        "SetDevtools must keep its queue position for the create drain"
+      );
+    }
+
+    // Failed create: `dispatch_or_queue_op` returns the creation error instead
+    // of accepting ops that would never be replayed.
+    *creation_error.lock().unwrap() = Some("injected create failure".to_string());
+    assert!(
+      dispatch_or_queue_op(&queue, &handle, &creation_error, &runtime, PendingOp::Reload).is_err(),
+      "ops after a failed create must surface the creation error"
+    );
+
+    // Create-drain semantics (Ok branch: `guard.drain(..)` then replay): the
+    // drain collects exactly the queued ops and leaves the queue empty.
+    let drained: Vec<PendingOp> = queue.lock().unwrap().drain(..).collect();
+    assert_eq!(drained.len(), 2, "drain must collect the queued ops");
+    assert!(queue.lock().unwrap().is_empty(), "drain must empty the queue");
+  }
+
+  /// UT for #195 + fix-variant m5: a queued open that can never replay (failed
+  /// create) releases the process-level intent via the REAL cleanup fn, so a
+  /// later webview's open dispatches again instead of silently no-oping.
+  #[cfg(any(debug_assertions, feature = "devtools"))]
+  #[test]
+  fn ut_failed_create_releases_queued_devtools_intent() {
+    let saved = DEVTOOLS_ENABLED.load(Ordering::SeqCst);
+    DEVTOOLS_ENABLED.store(false, Ordering::SeqCst);
+
+    // The webview's open_devtools flips the intent and queues SetDevtools.
+    assert!(devtools_open_intent(), "first open must flip the intent");
+
+    let mut queue: Vec<PendingOp> = vec![PendingOp::SetDevtools, PendingOp::Reload];
+    failed_create_cleanup(&mut queue);
+    assert!(queue.is_empty(), "cleanup must drop the never-replayable ops");
+    assert!(
+      devtools_open_intent(),
+      "after the cleanup released the intent, a later open must dispatch again"
+    );
+
+    DEVTOOLS_ENABLED.store(saved, Ordering::SeqCst);
   }
 
   // #189 (design D3): the unified dispose fence.
