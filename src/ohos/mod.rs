@@ -418,6 +418,11 @@ pub(crate) struct InnerWebView {
   url_cache: Arc<Mutex<String>>,
   bounds_cache: Mutex<Rect>,
   devtools_open: AtomicBool,
+  /// #188: the creation-time incognito flag (`WebViewAttributes.incognito`).
+  /// The main-thread `cookies_for_url` sync bridge is id-less, so the store
+  /// selector has to travel with the caller — retained here and passed to
+  /// `cookies_for_url_on_main_thread(url, incognito)`.
+  incognito: bool,
   // #189: the `is_child` field was removed — disposal is now unified for main
   // and child webviews ([`InnerWebView::dispose_child`]); child-only behavior
   // that remains (initial bounds conversion) uses the `new_inner` parameter.
@@ -994,6 +999,7 @@ impl InnerWebView {
       url_cache,
       bounds_cache: Mutex::new(initial_bounds),
       devtools_open,
+      incognito,
       disposed: AtomicBool::new(false),
     })
   }
@@ -1191,7 +1197,15 @@ impl InnerWebView {
         // Fetch synchronously through the dedicated `ohos.webview-cookie`
         // MainThreadSync plugin (ArkTS `fetchCookieSync`) instead. Returns
         // the real cookies rather than the old silent empty (issue #110).
-        let cookie_str = openharmony_ability_plugin_webview::cookies_for_url_on_main_thread(url)
+        // #188: the incognito flag rides along — the sync request is
+        // id-less, so without it the ArkTS side could only ever read the
+        // default store and an incognito webview's main-thread probe would
+        // silently observe non-incognito cookies.
+        let cookie_str =
+          openharmony_ability_plugin_webview::cookies_for_url_on_main_thread(
+            url,
+            self.incognito,
+          )
           .map_err(|e| {
             Error::OpenHarmonyWebviewError(format!(
               "cookies_for_url (main-thread sync bridge): {e}"
