@@ -1134,7 +1134,7 @@ impl<'a> WebViewBuilder<'a> {
   /// ## Platform-specific
   ///
   /// - **OpenHarmony:** when combined with
-  ///   [`PlatformSpecificWebViewAttributes::with_https_scheme`], the intercept
+  ///   [`WebViewBuilderExtOhos::with_https_scheme`], the intercept
   ///   channel is synchronous-only — a responder that fires after this closure
   ///   returns (the `std::thread::spawn` pattern in the example below) has its
   ///   result **discarded** and the request passes through (committer
