@@ -448,6 +448,38 @@ fn failed_create_cleanup(guard: &mut Vec<PendingOp>) {
   guard.clear();
 }
 
+/// PR review fix W1: the pre-handshake open queue attempt, factored out of
+/// [`InnerWebView::open_devtools`]'s `None` arm so the host UT exercises the
+/// REAL open_devtools-layer failure handling (not just `dispatch_or_queue_op`).
+/// Mirrors the m5 [`failed_create_cleanup`] semantics: when the queue is dead
+/// (creation already failed) the queued open can never replay, so the
+/// just-recorded process-level open intent must be released — otherwise
+/// `DEVTOOLS_ENABLED` latches `true` for the whole process and every later
+/// webview's `open_devtools` silently no-ops forever.
+#[cfg(any(debug_assertions, feature = "devtools"))]
+fn queue_pre_handshake_open(
+  pending_ops: &std::sync::Mutex<Vec<PendingOp>>,
+  handle: &OnceLock<WebviewHandle>,
+  creation_error: &std::sync::Mutex<Option<String>>,
+  runtime: &BridgeExecutor,
+) {
+  if let Err(e) = dispatch_or_queue_op(
+    pending_ops,
+    handle,
+    creation_error,
+    runtime,
+    PendingOp::SetDevtools,
+  ) {
+    // The queue rejected the open: release the intent so a later open (this
+    // or any other webview) dispatches again instead of no-oping forever.
+    devtools_close_intent();
+    log::warn!(
+      "[wry] open_devtools could not queue, open intent released: {}",
+      e
+    );
+  }
+}
+
 /// m4: the dispatch-or-queue decision + enqueue, factored out of the inherent
 /// method so the host UT exercises the REAL production path (queue /
 /// creation-failed / ready branches) instead of pushing into a scratch Vec.
@@ -1148,9 +1180,12 @@ impl InnerWebView {
         });
       }
       // Create still pending: queue for replay once the handshake completes.
-      None => {
-        let _ = self.dispatch_or_queue(PendingOp::SetDevtools);
-      }
+      None => queue_pre_handshake_open(
+        &self.pending_ops,
+        &self.handle,
+        &self.creation_error,
+        &self.runtime,
+      ),
     }
   }
 
@@ -1848,6 +1883,19 @@ mod tests {
   use super::*;
   use cookie::SameSite;
 
+  // PR review fix W3: UTs that rewrite the process-level `DEVTOOLS_ENABLED`
+  // flag must not interleave — the harness runs them on multiple threads and
+  // unsynchronized save/store/restore sequences would flip each other's state
+  // mid-assert (intermittent false reds). Every DEVTOOLS_ENABLED-touching UT
+  // holds this mutex for its whole body.
+  static DEVTOOLS_UT_LOCK: Mutex<()> = Mutex::new(());
+
+  fn devtools_ut_lock() -> std::sync::MutexGuard<'static, ()> {
+    DEVTOOLS_UT_LOCK
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+  }
+
   #[test]
   fn format_set_cookie_value_includes_core_attrs() {
     let cookie = Cookie::build(("token", "abc"))
@@ -1880,7 +1928,7 @@ mod tests {
   /// # Brief: build a cookie with a fixed expiry and assert the formatted
   /// attribute verbatim.
   #[test]
-  fn format_set_cookie_value_persistent_keeps_imf_fixdate_expires() {
+  fn ut_format_set_cookie_value_persistent_keeps_imf_fixdate_expires() {
     let dt = cookie::time::OffsetDateTime::new_utc(
       cookie::time::Date::from_calendar_date(2026, cookie::time::Month::January, 1).unwrap(),
       cookie::time::Time::MIDNIGHT,
@@ -1896,7 +1944,7 @@ mod tests {
   /// UT for #190①: a max-age duration is emitted as whole-second `Max-Age`.
   /// # Brief: build a cookie with max_age 3600s and assert `Max-Age=3600`.
   #[test]
-  fn format_set_cookie_value_max_age_whole_seconds() {
+  fn ut_format_set_cookie_value_max_age_whole_seconds() {
     let cookie = Cookie::build(("k", "v"))
       .max_age(cookie::time::Duration::seconds(3600))
       .build();
@@ -1909,7 +1957,7 @@ mod tests {
   /// UT for #190①: a session cookie carries neither persistence attribute.
   /// # Brief: build a bare cookie and assert both attributes are absent.
   #[test]
-  fn format_set_cookie_value_session_omits_both_attributes() {
+  fn ut_format_set_cookie_value_session_omits_both_attributes() {
     let cookie = Cookie::build(("k", "v")).build();
     let v = format_set_cookie_value(&cookie);
     assert!(
@@ -1926,7 +1974,7 @@ mod tests {
   /// RFC 6265 §5.3 Max-Age precedence is the receiving side's semantics).
   /// # Brief: build a cookie with expiry + max-age and assert both appear.
   #[test]
-  fn format_set_cookie_value_emits_both_when_both_given() {
+  fn ut_format_set_cookie_value_emits_both_when_both_given() {
     let dt = cookie::time::OffsetDateTime::new_utc(
       cookie::time::Date::from_calendar_date(2026, cookie::time::Month::January, 1).unwrap(),
       cookie::time::Time::MIDNIGHT,
@@ -1949,7 +1997,7 @@ mod tests {
   /// the pending promise settles instead of hanging.
   /// # Brief: feed an `Err` outcome to the payload helper and assert `"null"`.
   #[test]
-  fn eval_callback_payload_failure_is_null() {
+  fn ut_eval_callback_payload_failure_is_null() {
     let err = crate::Error::OpenHarmonyInitError("bridge gone".into());
     assert_eq!(eval_callback_payload(&Err(err)), "null");
   }
@@ -1958,7 +2006,7 @@ mod tests {
   /// (result passed through, `None` → empty string).
   /// # Brief: feed `Ok` outcomes to the payload helper and assert both shapes.
   #[test]
-  fn eval_callback_payload_success_passthrough() {
+  fn ut_eval_callback_payload_success_passthrough() {
     let ok_some: std::result::Result<Option<String>, crate::Error> = Ok(Some("42".to_string()));
     let ok_none: std::result::Result<Option<String>, crate::Error> = Ok(None);
     assert_eq!(eval_callback_payload(&ok_some), "42");
@@ -1971,7 +2019,7 @@ mod tests {
   /// rewrite applies, so the first IPC invoke resolves the real URL.
   /// # Brief: call the prefill helper with a URL and no protocols.
   #[test]
-  fn url_cache_prefill_uses_initial_url() {
+  fn ut_url_cache_prefill_uses_initial_url() {
     let empty: HashMap<String, SharedProtocolHandler> = HashMap::new();
     assert_eq!(
       url_cache_prefill(Some("https://example.com/app"), false, &empty),
@@ -1983,7 +2031,7 @@ mod tests {
   /// existing about:blank fallback stays in effect.
   /// # Brief: call the prefill helper with `None`.
   #[test]
-  fn url_cache_prefill_empty_without_url() {
+  fn ut_url_cache_prefill_empty_without_url() {
     let empty: HashMap<String, SharedProtocolHandler> = HashMap::new();
     assert_eq!(url_cache_prefill(None, false, &empty), "");
   }
@@ -1992,7 +2040,7 @@ mod tests {
   /// create request applies, so cache and request agree.
   /// # Brief: register the "tauri" protocol and assert the rewritten form.
   #[test]
-  fn url_cache_prefill_applies_https_rewrite() {
+  fn ut_url_cache_prefill_applies_https_rewrite() {
     let dummy: SharedProtocolHandler = Arc::new(SendSyncBox(Box::new(|_id, _req, _responder| {})));
     let mut protocols: HashMap<String, SharedProtocolHandler> = HashMap::new();
     protocols.insert("tauri".to_string(), dummy);
@@ -2301,6 +2349,9 @@ mod tests {
   /// UT for #186 M1: the protocol handler's response headers reach the wire
   /// struct as parallel arrays, with Content-Type excluded (it travels via
   /// `mime_type`) and non-UTF-8 headers skipped individually.
+  /// # Brief: 1) register a handler that responds with two extra headers
+  /// 2) dispatch through the intercept seam 3) assert the parallel arrays
+  /// stay aligned, carry the custom header, and exclude Content-Type.
   #[test]
   fn ut_intercept_response_headers_are_forwarded() {
     let mut m: HashMap<String, SharedProtocolHandler> = HashMap::new();
@@ -2351,6 +2402,8 @@ mod tests {
 
   /// UT for #186 M1 + D9: a handler that only sets Content-Type keeps the old
   /// wire shape — header arrays stay `None` (byte-identical default).
+  /// # Brief: 1) dispatch a Content-Type-only response 2) assert both header
+  /// arrays stay `None`.
   #[test]
   fn ut_intercept_headerless_response_keeps_old_wire_shape() {
     let resp = dispatch_https_intercept_sync(
@@ -2376,6 +2429,8 @@ mod tests {
 
   /// UT for #198: vp = 1.0 (desktop baseline and the ≤0/absent-binding
   /// fallback) is an identity — Physical(200,100) stays (200,100).
+  /// # Brief: 1) convert a Physical position and size at ratio 1.0 2) assert
+  /// both come back unchanged.
   #[test]
   fn ut_vp_conversion_identity_at_ratio_one() {
     let p = dpi::PhysicalPosition::new(200_i32, 100);
@@ -2392,6 +2447,8 @@ mod tests {
 
   /// UT for #198: vp = 2.0 halves Physical(200,100) → (100,50), while a
   /// Logical input passes through unchanged (dpi identity contract).
+  /// # Brief: 1) convert Physical position/size at ratio 2.0 and assert the
+  /// halved values 2) convert a Logical input and assert it is unchanged.
   #[test]
   fn ut_vp_conversion_halves_physical_and_keeps_logical() {
     let p = dpi::PhysicalPosition::new(200_i32, 100);
@@ -2416,6 +2473,9 @@ mod tests {
   /// through untouched. The LIVE binding value is device-real (1.9 on the
   /// desktop reference device), so the fallback contract is pinned on the pure
   /// guard, not on the environment.
+  /// # Brief: 1) feed NaN / ±inf / ≤0 to the guard and assert exactly 1.0
+  /// 2) feed real ratios and assert they pass through 3) assert the live
+  /// binding value stays finite and positive.
   #[test]
   fn ut_vp_ratio_guard_falls_back_to_one() {
     assert_eq!(vp_ratio_sanitized(f64::NAN), 1.0);
@@ -2440,6 +2500,8 @@ mod tests {
   /// UT for #192: Worker / Uninitialized states are cache-only — zero bridge
   /// traffic, the cached value comes back unchanged (and nothing blocks: the
   /// non-Main arms never touch the bridge at all).
+  /// # Brief: 1) seed the cache 2) query in Worker then Uninitialized state
+  /// 3) assert the cached value returns unchanged.
   #[test]
   fn ut_url_worker_and_uninitialized_states_return_cache_only() {
     let cache = Mutex::new("tauri://localhost/".to_string());
@@ -2457,6 +2519,8 @@ mod tests {
   /// handle is never registered in tests) falls back to the cached value —
   /// url() neither fails nor blocks (the refresh is a re-entrant MainThreadSync
   /// direct call; no recv_timeout exists anywhere on the path).
+  /// # Brief: 1) seed the cache 2) query in Main state with no sync bridge
+  /// registered 3) assert the cached value comes back.
   #[test]
   fn ut_url_main_state_bridge_failure_falls_back_to_cache() {
     let cache = Mutex::new("tauri://localhost/".to_string());
@@ -2471,8 +2535,13 @@ mod tests {
   /// UT for #195: the open intent flips exactly once — the first open reports
   /// "dispatch owed", repeat opens are idempotent no-ops, and close re-arms
   /// the flag so a later open dispatches again.
+  /// # Brief: 1) reset the flag 2) assert the first open reports dispatch owed
+  /// and repeats are no-ops 3) close consumes the open 4) open after close
+  /// dispatches again 5) restore the flag.
+  #[cfg(any(debug_assertions, feature = "devtools"))]
   #[test]
   fn ut_devtools_open_intent_is_idempotent_and_close_re_arms() {
+    let _guard = devtools_ut_lock();
     let saved = DEVTOOLS_ENABLED.load(Ordering::SeqCst);
     DEVTOOLS_ENABLED.store(false, Ordering::SeqCst);
     assert!(devtools_open_intent(), "first open must dispatch");
@@ -2501,6 +2570,10 @@ mod tests {
   /// (ops after failure must surface the error instead of queueing forever),
   /// and the create drain (`guard.drain(..)`, the Ok-branch semantics) empties
   /// the queue for replay.
+  /// # Brief: 1) queue SetDevtools + Reload pre-handshake 2) fail the create
+  /// and assert a follow-up op surfaces the error 3) drain and assert the
+  /// queue is empty.
+  #[cfg(any(debug_assertions, feature = "devtools"))]
   #[test]
   fn ut_dispatch_or_queue_set_devtools_real_path() {
     let queue: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2562,9 +2635,13 @@ mod tests {
   /// UT for #195 + fix-variant m5: a queued open that can never replay (failed
   /// create) releases the process-level intent via the REAL cleanup fn, so a
   /// later webview's open dispatches again instead of silently no-oping.
+  /// # Brief: 1) flip the intent 2) run failed_create_cleanup over a queue
+  /// holding SetDevtools 3) assert the queue empties and a later open
+  /// dispatches again.
   #[cfg(any(debug_assertions, feature = "devtools"))]
   #[test]
   fn ut_failed_create_releases_queued_devtools_intent() {
+    let _guard = devtools_ut_lock();
     let saved = DEVTOOLS_ENABLED.load(Ordering::SeqCst);
     DEVTOOLS_ENABLED.store(false, Ordering::SeqCst);
 
@@ -2585,11 +2662,75 @@ mod tests {
     DEVTOOLS_ENABLED.store(saved, Ordering::SeqCst);
   }
 
+  /// PR review fix W1: the open_devtools LAYER (not just `dispatch_or_queue_op`)
+  /// releases the just-recorded open intent when the queue is dead (create
+  /// already failed) — otherwise the process-level flag latches and every
+  /// later webview's open_devtools silently no-ops forever.
+  /// # Brief: 1) flip the intent with the create already failed 2) run the
+  /// real queue_pre_handshake_open 3) assert the intent was released and a
+  /// later open dispatches again 4) positive control: a healthy queue holds
+  /// the op and keeps the intent latched.
+  #[cfg(any(debug_assertions, feature = "devtools"))]
+  #[test]
+  fn ut_open_devtools_dead_queue_releases_intent_for_later_opens() {
+    let _guard = devtools_ut_lock();
+    let saved = DEVTOOLS_ENABLED.load(Ordering::SeqCst);
+    DEVTOOLS_ENABLED.store(false, Ordering::SeqCst);
+
+    let queue: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
+    let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let runtime = BridgeExecutor::new();
+
+    // open_devtools' first step flips the intent; then the None arm hits the
+    // dead queue (create already failed — the m4 state dispatch rejects).
+    assert!(devtools_open_intent(), "first open must flip the intent");
+    *creation_error.lock().unwrap() = Some("injected create failure".to_string());
+    queue_pre_handshake_open(&queue, &handle, &creation_error, &runtime);
+
+    assert!(
+      !DEVTOOLS_ENABLED.load(Ordering::SeqCst),
+      "the dead queue must release the process-level open intent"
+    );
+    assert!(
+      queue.lock().unwrap().is_empty(),
+      "the dead queue must not have accepted the open"
+    );
+    assert!(
+      devtools_open_intent(),
+      "after the release a later open must dispatch again (no permanent latch)"
+    );
+    // The probe above re-latched the flag; reset for the control phase.
+    DEVTOOLS_ENABLED.store(false, Ordering::SeqCst);
+
+    // Positive control: with the queue healthy the same layered path queues
+    // the op and the intent stays latched (idempotence fence intact).
+    *creation_error.lock().unwrap() = None;
+    assert!(devtools_open_intent(), "control open must flip the intent");
+    queue_pre_handshake_open(&queue, &handle, &creation_error, &runtime);
+    {
+      let guard = queue.lock().unwrap();
+      assert_eq!(guard.len(), 1, "the healthy queue must hold the open");
+      assert!(
+        matches!(guard[0], PendingOp::SetDevtools),
+        "the queued op must be SetDevtools for the create drain"
+      );
+    }
+    assert!(
+      DEVTOOLS_ENABLED.load(Ordering::SeqCst),
+      "a queued open keeps the intent latched (idempotence fence intact)"
+    );
+
+    DEVTOOLS_ENABLED.store(saved, Ordering::SeqCst);
+  }
+
   // #189 (design D3): the unified dispose fence.
 
   /// UT for #189: the fence fires exactly once — a fresh webview owes the
   /// `Remove` dispatch (main webviews included: the is_child gate is gone),
   /// and the second call (double Drop / double dispose) is a no-op.
+  /// # Brief: 1) dispose three times 2) assert only the first reports a
+  /// dispatch owed and the flag ends true.
   #[test]
   fn ut_dispose_fence_fires_once_and_double_drop_is_noop() {
     let disposed = AtomicBool::new(false);
@@ -2642,6 +2783,8 @@ mod tests {
 
   /// UT for #186: a POST method with parallel header arrays is rebuilt on the
   /// handler's Request (names and values stay paired, in order).
+  /// # Brief: 1) dispatch a POST with two parallel header arrays 2) assert the
+  /// method and both paired headers reach the handler.
   #[test]
   fn ut_intercept_method_and_headers_reach_handler() {
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -2668,6 +2811,8 @@ mod tests {
 
   /// UT for #186: no wire fields (older ArkTS bridge plugins) keep the
   /// historical shape — method defaults to GET and no headers are attached.
+  /// # Brief: 1) dispatch with all wire fields absent 2) assert GET and zero
+  /// headers on the handler's Request.
   #[test]
   fn ut_intercept_missing_fields_fall_back_to_get_no_headers() {
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -2690,6 +2835,8 @@ mod tests {
 
   /// UT for #186: a malformed method falls back to GET, and a single invalid
   /// header name is skipped without sinking the request or its valid peers.
+  /// # Brief: 1) dispatch a malformed method + one bad header name 2) assert
+  /// the GET fallback and that the valid peer header survives.
   #[test]
   fn ut_intercept_invalid_method_and_headers_degrade_safely() {
     let captured = Arc::new(Mutex::new(Vec::new()));
