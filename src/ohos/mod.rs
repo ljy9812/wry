@@ -677,8 +677,9 @@ impl InnerWebView {
         match (handler.0)(req.target_url, features) {
           crate::NewWindowResponse::Allow => true,
           crate::NewWindowResponse::Deny => false,
-          // Create: Tauri already built its own OS window (the Float
-          // WebviewWindow) and will load the target URL into it. Return false
+          // Create: Tauri already built its own OS window (the sub-window
+          // WebviewWindow, OHOSWindowKind::SubWindow) and will load the target
+          // URL into it. Return false
           // so ArkWeb CANCELS its own popup — the bridge then runs the
           // non-blocking Deny path (setWebController(null)) instead of
           // spawning a duplicate dialog. Returning true here would tell ArkWeb
