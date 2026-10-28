@@ -2343,6 +2343,7 @@ impl WebView {
   ///     tauri-runtime-wry's `i32::MIN` sentinel components (partial
   ///     updates) never enter the cache - a sentinel-carrying axis keeps its
   ///     previously cached value.
+  ///
   ///   In every case a cached component reflects only the last real write;
   ///   do not use this value to reconstruct or fill in unknown geometry
   ///   components.
