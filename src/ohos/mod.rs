@@ -195,6 +195,10 @@ unsafe impl<T> Sync for SendSyncBox<T> {}
 #[derive(Clone)]
 pub(crate) struct BridgeExecutor {
   handle: tokio::runtime::Handle,
+  // Gate F5: the dedicated pump thread is retained so spawn sites can
+  // synchronously detect a dead bridge runtime: that thread is the only
+  // poller of the futures this executor enqueues.
+  pump_thread: Arc<Mutex<std::thread::JoinHandle<()>>>,
 }
 
 impl BridgeExecutor {
@@ -222,14 +226,32 @@ impl BridgeExecutor {
       .build()
       .expect("Failed to create wry bridge runtime");
     let handle = runtime.handle().clone();
-    std::thread::Builder::new()
+    let pump_thread = std::thread::Builder::new()
       .name("ohos-wry-bridge-rt".into())
       .spawn(move || runtime.block_on(std::future::pending::<()>()))
       .expect("Failed to spawn wry bridge runtime thread");
-    Self { handle }
+    Self {
+      handle,
+      pump_thread: Arc::new(Mutex::new(pump_thread)),
+    }
+  }
+
+  /// Gate F5: synchronous liveness probe for the bridge runtime. The pump
+  /// thread is the only poller of spawned futures; once it has terminated
+  /// (panic or return), every future enqueued from then on is never polled.
+  /// `JoinHandle::is_finished` is a snapshot: a thread that dies right after
+  /// this check is the disclosed residual gap (see `open_devtools`).
+  pub(crate) fn pump_thread_alive(&self) -> bool {
+    !self.pump_thread.lock().unwrap().is_finished()
   }
 
   /// Spawn a fire-and-forget bridge call. The result is ignored.
+  ///
+  /// Gate F5: this cannot report an enqueue failure: tokio 1.x
+  /// `Handle::spawn` never fails the enqueue (a task bound onto a dead
+  /// runtime is simply never polled, and no error surfaces). Spawn sites
+  /// whose effect must not be silently lost on a dead runtime check
+  /// [`BridgeExecutor::pump_thread_alive`] right after spawning.
   pub(crate) fn spawn<F>(&self, future: F)
   where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -390,6 +412,13 @@ impl PendingOp {
 /// ([`failed_create_cleanup`]), a failed replay (`PendingOp::SetDevtools`)
 /// and a failed ready-branch dispatch ([`devtools_open_failed`]) — so a
 /// single failure can never block all later opens in the process.
+///
+/// Gate F5: the ready-branch dispatch additionally releases the intent when
+/// the bridge runtime's pump thread is already dead at spawn time
+/// ([`BridgeExecutor::pump_thread_alive`]). Known limitation (disclosed): if
+/// that thread dies right after the check, the enable future is never polled,
+/// so neither the enable nor its async failure handler runs and the intent
+/// stays latched: a later `open_devtools` early-returns on the fence.
 #[cfg(any(debug_assertions, feature = "devtools"))]
 static DEVTOOLS_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -1231,6 +1260,23 @@ impl InnerWebView {
             devtools_open_failed("open_devtools", &e);
           }
         });
+        // Gate F5: synchronous failure leg. `BridgeExecutor::spawn` cannot
+        // report an enqueue failure (tokio 1.x `Handle::spawn` never fails
+        // the enqueue), but the bridge runtime's pump thread is the only
+        // poller: when it has already terminated, the enable future above is
+        // never polled (neither succeeding nor reaching the async
+        // `devtools_open_failed`), so release the intent here. Residual gap
+        // (disclosed known limitation): a thread that dies right after this
+        // check leaves the intent latched until a later open re-enters the
+        // dispatch path.
+        if !self.runtime.pump_thread_alive() {
+          devtools_open_failed(
+            "open_devtools",
+            &crate::Error::OpenHarmonyWebviewError(
+              "bridge runtime pump thread is dead; the enable will never be polled".into(),
+            ),
+          );
+        }
       }
       // Create still pending: queue for replay once the handshake completes.
       None => queue_pre_handshake_open(
@@ -2853,6 +2899,26 @@ mod tests {
     );
 
     DEVTOOLS_ENABLED.store(saved, Ordering::SeqCst);
+  }
+
+  // Gate F5: the ready-branch dispatch releases the intent when the bridge
+  // runtime's pump thread is already dead at spawn time (its async enable
+  // future would otherwise never be polled and the idempotence fence would
+  // latch forever).
+
+  /// Gate F5: `pump_thread_alive` reports a live pump thread for a healthy
+  /// executor (the probe the ready-branch `open_devtools` consults after
+  /// spawning). The dead side of the probe (a terminated pump thread) cannot be
+  /// produced deterministically here: the shared runtime's thread is owned by
+  /// the process-wide executor, so this UT pins only the healthy arm.
+  /// # Brief: 1) get the executor 2) assert `pump_thread_alive` is true.
+  #[test]
+  fn ut_bridge_executor_pump_thread_alive_probe_healthy() {
+    let runtime = BridgeExecutor::new();
+    assert!(
+      runtime.pump_thread_alive(),
+      "a fresh bridge runtime must report a live pump thread"
+    );
   }
 
   // #189 (design D3): the unified dispose fence.
