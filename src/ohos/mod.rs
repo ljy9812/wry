@@ -55,7 +55,7 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
 /// window physical coordinates into ArkUI vp units for webview geometry
 /// (`create` child bounds and [`InnerWebView::set_bounds`]). Thin wrapper over
 /// the ability binding `openharmony_ability::virtual_pixel_ratio` (which
-/// already falls back to 1.0 on a ≤0/absent binding); this second guard keeps
+/// already falls back to 1.0 on a <=0/absent binding); this second guard keeps
 /// the f32→f64 widening total so geometry conversion never divides by zero or
 /// NaN. The live ratio is device-real: the OHOS desktop reference device
 /// reports vp = 1.9, so physical px is divided by vp before it reaches ArkUI
@@ -1477,9 +1477,11 @@ impl InnerWebView {
     // sentinel component, so the merge is a wholesale replace of the
     // `Rect::default()` start value, and a bounds-less webview seeds from
     // the builder default (logical origin + 200x200). The create-request
-    // style write above keeps using the unfiltered `initial_bounds` - the
-    // wire carries the raw request and the ArkTS render layer does its own
-    // sentinel skipping.
+    // style write above does run `initial_bounds` through
+    // `geometry_to_logical_vp` / `size_to_logical_vp` first (like the
+    // set_bounds path), so the wire carries the vp-converted request; what
+    // it does not apply is the sentinel merge screening above - the ArkTS
+    // render layer does its own sentinel skipping.
     //
     // Execution model (PR#26 review round 3): this seed merge runs
     // synchronously in the builder body, NOT as part of the spawned create
@@ -1633,7 +1635,8 @@ impl InnerWebView {
         // new-window create path (a pump thread dying between the enqueue
         // and the first poll of the create future runs neither match arm, so
         // all six release points (W26-4's four failure paths plus the two
-        // dead-pump legs this branch added) are skipped - see
+        // dead-pump legs this change adds - the ready-branch leg below and
+        // the create-future drain leg) are skipped - see
         // the pump-thread-dies-before-poll disclosure above (PR#26 round 3).
         if !self.runtime.pump_thread_alive() {
           devtools_open_failed(
@@ -1869,10 +1872,12 @@ impl InnerWebView {
   /// # Cache semantics (not a live geometry readback)
   ///
   /// The value is cache-only: written at creation (builder bounds) and on
-  /// every `set_bounds`. `wry` itself never refreshes it on window resizes —
-  /// freshness depends entirely on the embedding runtime re-issuing
-  /// `set_bounds`, which tauri-runtime-wry does on window resize only
-  /// through its autoresize flow (that re-issued call writes this cache).
+  /// every `set_bounds` (except the dead-pump branch of `set_bounds`, which
+  /// warns and leaves the cache unchanged). `wry` itself never refreshes it
+  /// on window resizes — freshness depends entirely on the embedding
+  /// runtime re-issuing `set_bounds`, which tauri-runtime-wry does on window
+  /// resize only through its autoresize flow (that re-issued call writes
+  /// this cache).
   /// Without that flow the cache goes stale as the window resizes.
   ///
   /// ArkUI-initiated layout changes DO occur and are NOT observed (no bridge
@@ -2942,9 +2947,13 @@ mod tests {
 
   // ─── p3 committer-issues batch: #189/#192/#195/#198 unit tests ─────────────
 
-  // #198 (design D6): the vp conversion contract. Host baseline: the ability
-  // binding falls back to 1.0 when no display is attached, so the wrapper
-  // below must report exactly 1.0 and the conversion must be an identity.
+  // #198 (design D6): the vp conversion contract. Nothing here runs on the
+  // host: `src/ohos` is device-gated and a host `cargo test` never builds
+  // this path (see the module note above). The identity UT below pins the
+  // mapping directly - it passes ratio 1.0 (the <=0/absent-binding fallback
+  // value) into the conversion helpers and asserts physical coordinates come
+  // back unchanged, so it depends on no host behavior and never calls the
+  // `vp_ratio_sanitized` wrapper.
 
   /// UT for #198: vp = 1.0 (the <=0/absent-binding fallback; the OHOS
   /// desktop reference device reports vp = 1.9) is an identity —
@@ -3018,12 +3027,12 @@ mod tests {
     assert_eq!(y, 5.0);
   }
 
-  /// UT for #198: the wrapper's sanitize guard is deterministic — ≤0, NaN and
-  /// ±inf fall back to exactly 1.0 (never a division hazard), real ratios pass
+  /// UT for #198: the wrapper's sanitize guard is deterministic — <=0, NaN and
+  /// +/-inf fall back to exactly 1.0 (never a division hazard), real ratios pass
   /// through untouched. The LIVE binding value is device-real (1.9 on the
   /// desktop reference device), so the fallback contract is pinned on the pure
   /// guard, not on the environment.
-  /// # Brief: 1) feed NaN / ±inf / ≤0 to the guard and assert exactly 1.0
+  /// # Brief: 1) feed NaN / +/-inf / <=0 to the guard and assert exactly 1.0
   /// 2) feed real ratios and assert they pass through 3) assert the live
   /// binding value stays finite and positive.
   #[test]
