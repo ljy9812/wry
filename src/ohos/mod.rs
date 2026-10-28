@@ -183,8 +183,8 @@ fn size_components(s: dpi::Size) -> (f64, f64) {
 /// `i32::MIN`-derived garbage values into that rate cache (only for a
 /// webview holding a rate cache: on OHOS that is one created with explicit
 /// bounds AND auto_resize armed at create; runtime arming never creates a
-/// holder there, the `SetAutoResize` enable leg is a no-op on OHOS - only
-/// desktop's enable leg re-derives rates from the live bounds), and the
+/// holder there because the `SetAutoResize` enable leg is a no-op on OHOS -
+/// only desktop's enable leg re-derives rates from the live bounds), and the
 /// next `TaoWindowEvent::Resized` fires the
 /// auto-resize re-apply leg, which multiplies the garbage rates by the new
 /// window size into a full real `Rect` and re-sends it - applied as usual.
