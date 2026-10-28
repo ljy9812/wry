@@ -1439,11 +1439,11 @@ impl InnerWebView {
     // future, so it has no pump-liveness precondition at all - unlike the
     // create drain, whose liveness check pins an invariant of pump-polled
     // execution and merely covers an execution-model change. Carve-out: this
-    // seed write is the disclosed fourth path where the cache holds
-    // requested-not-applied geometry (e.g. a MAIN webview with explicit
+    // seed write is the disclosed 2x2 row where the cache holds
+    // requested-not-applied geometry (a MAIN webview with explicit
     // `with_bounds` is seeded with the explicit rect while the
     // create-geometry style write is gated on `is_child`), matching the
-    // creation rows documented on `WebView::bounds`; the Gate F3
+    // creation matrix documented on `WebView::bounds`; the Gate F3
     // "bounds() never reports unapplied set_bounds geometry" promise covers
     // the set_bounds path only.
     let mut bounds_cache_seed = Rect::default();
