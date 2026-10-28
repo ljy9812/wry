@@ -204,8 +204,8 @@ fn size_components(s: dpi::Size) -> (f64, f64) {
 /// behavior).
 ///
 /// The dispatched `PendingOp::SetBounds` is unaffected either way: the wire
-/// carries the raw request and the ArkTS render layer does its own sentinel
-/// skipping; this merge only governs the read-back bookkeeping.
+/// carries the vp-converted request and the ArkTS render layer does its own
+/// sentinel skipping; this merge only governs the read-back bookkeeping.
 fn merge_bounds_into_cache(cache: &mut Rect, incoming: Rect) {
   let (ix, iy) = position_components(incoming.position);
   let x_set = ix != I32_MIN_SENTINEL;
@@ -429,7 +429,7 @@ impl BridgeExecutor {
   /// `Handle::spawn` never fails the enqueue (a task bound onto a dead
   /// runtime is simply never polled, and no error surfaces). The two effects
   /// guarded against that silent loss are:
-  /// - the devtools open intent - the process's one execution point that
+  /// - the devtools open intent - the process's execution point that
   ///   must not be lost: its dispatch sites consult
   ///   [`BridgeExecutor::pump_thread_alive`] (the ready-branch open right
   ///   after spawning, the pre-handshake queue arm before enqueueing) and
@@ -441,7 +441,12 @@ impl BridgeExecutor {
   ///   the cache with the builder bounds before any application exists;
   ///   see the two MAIN creation rows on `WebView::bounds` whose cache
   ///   does not reflect applied geometry - the default placeholder row
-  ///   and the requested-but-never-applied row).
+  ///   and the requested-but-never-applied row; the second disclosed
+  ///   exception: while the creation handshake is pending, a live pump
+  ///   takes the queue arm (dispatch_or_queue_op queues the op and
+  ///   returns Ok without applying it) yet the cache write still records
+  ///   the request, so `bounds()` reports requested-but-not-yet-applied
+  ///   geometry until the handshake completes and the queue drains).
   ///
   /// Every other op sent through here (eval, zoom, set_visible, focus,
   /// load_url, print, ...) stays silently lost on a dead pump - the
@@ -839,7 +844,14 @@ fn set_bounds_with_cache(
   // any render-layer application exists, so on the two MAIN creation rows
   // documented on `WebView::bounds` the cache does not reflect applied
   // geometry (the default placeholder row and the requested-but-never-applied
-  // row). TOCTOU residual gap (disclosed): a thread dying right after this
+  // row).
+  // The second disclosed exception: while the creation handshake is
+  // pending, a live pump takes the queue arm (dispatch_or_queue_op
+  // queues the op and returns Ok without applying it) yet the cache
+  // write below still records the request, so bounds() reports
+  // requested-but-not-yet-applied geometry until the handshake
+  // completes and the queue drains.
+  // TOCTOU residual gap (disclosed): a thread dying right after this
   // check still leaves the cache written but unapplied.
   if runtime.pump_thread_alive() {
     merge_bounds_into_cache(&mut bounds_cache.lock().unwrap(), bounds);
@@ -1464,9 +1476,10 @@ impl InnerWebView {
     // are unaffected: the builder default (logical origin + 200x200) has no
     // sentinel component, so the merge is a wholesale replace of the
     // `Rect::default()` start value, and a bounds-less webview seeds from
-    // that default. The create-request style write above keeps using the
-    // unfiltered `initial_bounds` - the wire carries the raw request and the
-    // ArkTS render layer does its own sentinel skipping.
+    // the builder default (logical origin + 200x200). The create-request
+    // style write above keeps using the unfiltered `initial_bounds` - the
+    // wire carries the raw request and the ArkTS render layer does its own
+    // sentinel skipping.
     //
     // Execution model (PR#26 review round 3): this seed merge runs
     // synchronously in the builder body, NOT as part of the spawned create
@@ -1576,12 +1589,13 @@ impl InnerWebView {
   // dead queue (`queue_pre_handshake_open`), a failed create
   // (`failed_create_cleanup`), a failed replay (`PendingOp::SetDevtools`)
   // and a failed ready-branch dispatch (`devtools_open_failed`). The
-  // disclosed pre-poll death window (see the new-window note above) is one
-  // of the latch-forever timelines - alongside the ready-branch TOCTOU and
-  // drain-point TOCTOU residual gaps disclosed at their corresponding notes
-  // - and it is not a failure path: a pump thread dying between the enqueue
+  // disclosed pre-poll death window (see the pump-thread-dies-before-poll
+  // disclosure above, PR#26 round 3) is one of the latch-forever timelines
+  // - alongside the ready-branch TOCTOU and drain-point TOCTOU residual
+  // gaps disclosed at their corresponding notes - and it is not a
+  // failure path: a pump thread dying between the enqueue
   // and the first poll of the create future runs neither match arm, no
-  // failure event fires there, so all four release points are skipped and a
+  // failure event fires there, so all six release points are skipped and a
   // queued `SetDevtools` keeps the intent latched. The per-webview
   // `devtools_open` flag is NOT rolled back on an async enable failure: it
   // records the requested intent (what `is_devtools_open` reports), and a
@@ -1618,8 +1632,9 @@ impl InnerWebView {
         // latch-forever timeline: the disclosed pre-poll death window on the
         // new-window create path (a pump thread dying between the enqueue
         // and the first poll of the create future runs neither match arm, so
-        // all four W26-4 release points are skipped) ends the same way - see
-        // the new-window note above.
+        // all six release points (W26-4's four failure paths plus the two
+        // dead-pump legs this branch added) are skipped - see
+        // the pump-thread-dies-before-poll disclosure above (PR#26 round 3).
         if !self.runtime.pump_thread_alive() {
           devtools_open_failed(
             "open_devtools",
@@ -2931,8 +2946,9 @@ mod tests {
   // binding falls back to 1.0 when no display is attached, so the wrapper
   // below must report exactly 1.0 and the conversion must be an identity.
 
-  /// UT for #198: vp = 1.0 (desktop baseline and the ≤0/absent-binding
-  /// fallback) is an identity — Physical(200,100) stays (200,100).
+  /// UT for #198: vp = 1.0 (the <=0/absent-binding fallback; the OHOS
+  /// desktop reference device reports vp = 1.9) is an identity —
+  /// Physical(200,100) stays (200,100).
   /// # Brief: 1) convert a Physical position and size at ratio 1.0 2) assert
   /// both come back unchanged.
   #[test]

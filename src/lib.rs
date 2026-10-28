@@ -2318,7 +2318,7 @@ impl WebView {
   /// What the value represents is platform-dependent:
   ///
   /// - **Windows / macOS / iOS**: the current geometry, read back live from
-  ///   the platform view (for child webviews).
+  ///   the platform view.
   /// - **Linux (GTK)**: the read-back is partial - on X11 the position and
   ///   size come from the X window attributes of the webview's own X window
   ///   (for child webviews); a MAIN webview embeds directly into the parent
@@ -2383,6 +2383,9 @@ impl WebView {
   ///
   /// This is only effective if the webview was created as a child
   /// or created using `WebViewBuilderExtUnix::new_gtk` with `gtk::Fixed`.
+  ///
+  /// The gtk/child-scope sentence above is Unix-desktop-only; OpenHarmony
+  /// is not governed by it.
   ///
   /// OpenHarmony: the OHOS backend forwards the request to the ArkTS render
   /// layer, which applies position AND size for a full request and skips
