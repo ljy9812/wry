@@ -158,19 +158,42 @@ fn size_components(s: dpi::Size) -> (f64, f64) {
 /// ArkTS render layer's granularity (it skips sentinel components and
 /// applies only the set ones). Whether a single-component sentinel can
 /// arrive splits by input surface. The internal producers -
-/// tauri-runtime-wry's own construction sites - send whole-axis sentinel
-/// pairs only (`SetSize` rides `ohos_unspecified_position()`, `SetPosition`
-/// rides `ohos_unspecified_size()`, issue Eulogizethesun/tauri#241); the
-/// whole-axis pair is the only shape they emit. But the public `set_bounds`
+/// tauri-runtime-wry's own construction sites - never emit a
+/// single-component sentinel: the `SetSize` and `SetPosition` construction
+/// sites send whole-axis sentinel pairs (`SetSize` rides
+/// `ohos_unspecified_position()`, `SetPosition` rides
+/// `ohos_unspecified_size()`, issue Eulogizethesun/tauri#241) while the
+/// auto-resize re-apply leg sends all-real components (every rate times the
+/// new window size, zero sentinels); no internal site hand-mixes a
+/// single-component sentinel. But the public `set_bounds`
 /// surface - a direct-wry consumer, or an application author whose request
 /// passes through tauri core unchanged - can hand-craft a mixed partial such
 /// as `Position::Logical(i32::MIN, 100.0)` today. Such a request is
 /// REACHABLE input, not a hypothetical: per the wire contract (`i32::MIN` =
 /// this component unset) a deliberate hand-crafted mix is a legal request,
 /// so the per-component merge handles reachable input rather than being
-/// purely defensive. Future per-axis protocol growth is a further motive for
-/// the same behavior; the F5 UT exists to pin this formula's correctness for
-/// that input class, not to describe a production defect.
+/// purely defensive. Second-hop disclosure (review round 5): that legality
+/// and this merge hold at the wry hop; the same input, relayed through
+/// tauri core, also reaches runtime-wry's `WebviewMessage::SetBounds`
+/// rate-cache write, which does NOT screen sentinels - it writes all four
+/// rates (`x_rate`/`y_rate`/`width_rate`/`height_rate`) unconditionally for
+/// a webview holding a rate cache, whereas the `SetSize` arm writes only
+/// the width/height rates and the `SetPosition` arm only the x/y rates (the
+/// sentinel component is not written). A hand-mixed sentinel therefore puts
+/// `i32::MIN`-derived garbage values into that rate cache (only for a
+/// webview holding a rate cache: explicit-bounds create, or autoresize
+/// already armed), and the next `TaoWindowEvent::Resized` fires the
+/// auto-resize re-apply leg, which multiplies the garbage rates by the new
+/// window size into a full real `Rect` and re-sends it - applied as usual.
+/// The consequence is bounded and recoverable (any later real `set_bounds`
+/// overwrites the rates), and the trigger requires an application author to
+/// deliberately hand-craft `i32::MIN` components (pathological input); the
+/// wry-side bounds-cache read-back invariant is unaffected. That second-hop
+/// screening gap is a disclosed cross-repo limitation (issue
+/// Eulogizethesun/tauri#241), not a defensive failure of this merge. Future
+/// per-axis protocol growth is a further motive for the same behavior; the
+/// F5 UT exists to pin this formula's correctness for that input class, not
+/// to describe a production defect.
 /// Per-component updates stay within one dpi variant
 /// (a variant switch would mix units without a scale factor); a cross-variant
 /// axis is only replaced when ALL of its components are set, otherwise the
@@ -1550,11 +1573,13 @@ impl InnerWebView {
   // dead queue (`queue_pre_handshake_open`), a failed create
   // (`failed_create_cleanup`), a failed replay (`PendingOp::SetDevtools`)
   // and a failed ready-branch dispatch (`devtools_open_failed`). The
-  // disclosed pre-poll death window (see the new-window note above) is the
-  // remaining latch-forever timeline - a pump thread dying between the
-  // enqueue and the first poll of the create future runs neither match arm,
-  // no failure event fires there, so all four release points are skipped and
-  // a queued `SetDevtools` keeps the intent latched. The per-webview
+  // disclosed pre-poll death window (see the new-window note above) is one
+  // of the latch-forever timelines - alongside the ready-branch TOCTOU and
+  // drain-point TOCTOU residual gaps disclosed at their corresponding notes
+  // - and it is not a failure path: a pump thread dying between the enqueue
+  // and the first poll of the create future runs neither match arm, no
+  // failure event fires there, so all four release points are skipped and a
+  // queued `SetDevtools` keeps the intent latched. The per-webview
   // `devtools_open` flag is NOT rolled back on an async enable failure: it
   // records the requested intent (what `is_devtools_open` reports), and a
   // later `close_devtools` clears it.
@@ -1852,7 +1877,7 @@ impl InnerWebView {
   /// a later write replaces it. Conversely, a MAIN webview created WITH an
   /// explicit `with_bounds` writes no create geometry at all (the style write
   /// is gated on `is_child && bounds.is_some()`) while the cache still holds
-  /// the explicit rectangle - the "requested but never applied" case. Callers
+  /// the explicit rectangle - the "requested-but-never-applied" case. Callers
   /// must not use this value to
   /// reconstruct or fill in unknown geometry components: tauri-runtime-wry's
   /// i32::MIN sentinels (partial `set_bounds` updates, issue
