@@ -90,6 +90,63 @@ pub(crate) fn size_to_logical_vp(value: dpi::Size, vp: f64) -> (f64, f64) {
   value.to_logical::<f64>(vp).into()
 }
 
+// ─── ability-F6: sentinel-safe bounds cache merge ────────────────────────────────
+
+/// The "component not set by this call" sentinel of the cross-repo OHOS wire
+/// contract (tauri-runtime-wry `OHOS_BOUNDS_UNSET`, issue
+/// Eulogizethesun/tauri#241): `i32::MIN` widened to f64. tauri-runtime-wry
+/// sends it as a LOGICAL whole-axis pair (`ohos_unspecified_position` /
+/// `ohos_unspecified_size`) so the exact value reaches the ArkTS render layer,
+/// which skips sentinel components and applies only the set ones.
+const I32_MIN_SENTINEL: f64 = i32::MIN as f64;
+
+/// Raw (x, y) components of a `dpi::Position` with NO logical/physical
+/// conversion; sentinel screening must compare the caller's own units.
+fn position_components(p: dpi::Position) -> (f64, f64) {
+  match p {
+    dpi::Position::Physical(v) => (f64::from(v.x), f64::from(v.y)),
+    dpi::Position::Logical(v) => (v.x, v.y),
+  }
+}
+
+/// Raw (width, height) components of a `dpi::Size` with NO logical/physical
+/// conversion.
+fn size_components(s: dpi::Size) -> (f64, f64) {
+  match s {
+    dpi::Size::Physical(v) => (f64::from(v.width), f64::from(v.height)),
+    dpi::Size::Logical(v) => (v.width, v.height),
+  }
+}
+
+/// ability-F6: the cache write of [`InnerWebView::set_bounds`]. A request
+/// carrying the [`I32_MIN_SENTINEL`] in any component of an axis is a partial
+/// update for that axis ("this component is not set"); writing it into the
+/// public bounds cache would hand `bounds()` readers -2147483648.0 as a real
+/// position/size. Sentinel-carrying axes therefore keep the cached value
+/// wholesale (the cache's variant and units stay self-consistent); axes with
+/// only real components are replaced, which is the pre-F6 behavior. The
+/// wire's partial requests are whole-axis sentinel pairs
+/// (`ohos_unspecified_position` / `ohos_unspecified_size`), so axis
+/// granularity covers the real contract; a hypothetical mixed-variant
+/// per-component partial keeps the cached axis too (conservative: there is
+/// no sentinel-free interpretation without a scale factor).
+///
+/// The dispatched `PendingOp::SetBounds` is unaffected either way: the wire
+/// carries the raw request and the ArkTS render layer does its own sentinel
+/// skipping; this merge only governs the read-back bookkeeping.
+fn merge_bounds_into_cache(cache: &mut Rect, incoming: Rect) {
+  let (ix, iy) = position_components(incoming.position);
+  let (iw, ih) = size_components(incoming.size);
+  let position_is_set = ix != I32_MIN_SENTINEL && iy != I32_MIN_SENTINEL;
+  let size_is_set = iw != I32_MIN_SENTINEL && ih != I32_MIN_SENTINEL;
+  if position_is_set {
+    cache.position = incoming.position;
+  }
+  if size_is_set {
+    cache.size = incoming.size;
+  }
+}
+
 /// #189: the disposal idempotence fence shared by `dispose_child` and `Drop`.
 /// Returns `true` exactly once per webview — the first caller wins and owes
 /// the `Remove` dispatch; every later call (including a double Drop) is a
@@ -1517,15 +1574,22 @@ impl InnerWebView {
   /// geometry.
   ///
   /// For a natural-layout (bounds-less) webview the cache holds the
-  /// `WebViewAttributes::default()` placeholder — logical position (0, 0),
-  /// size 200×200 — NOT the actual on-screen geometry, which follows the
+  /// `WebViewAttributes::default()` placeholder - logical position (0, 0),
+  /// size 200x200 - NOT the actual on-screen geometry, which follows the
   /// container. (The `None` arm of the `unwrap_or_default` that seeds this
   /// cache is unreachable through the public builder API: the attributes
-  /// default starts at `Some(200×200)` and `with_bounds` only ever writes
-  /// `Some`.) Callers must not use this value to reconstruct or fill in
-  /// unknown geometry components (tauri-runtime-wry's i32::MIN sentinels):
-  /// a cached component reflects only what was last written through the
-  /// builder or `set_bounds`.
+  /// default starts at `Some(200x200)` and `with_bounds` only ever writes
+  /// `Some`.) Path note: that placeholder is "not real geometry" only for a
+  /// MAIN webview - a child webview created with the same default gets the
+  /// placeholder written as EXPLICIT create geometry (`is_child &&
+  /// bounds.is_some()`), so `bounds()` reads back the requested 200x200 until
+  /// a later write replaces it. Callers must not use this value to
+  /// reconstruct or fill in unknown geometry components: tauri-runtime-wry's
+  /// i32::MIN sentinels (partial `set_bounds` updates, issue
+  /// Eulogizethesun/tauri#241) never enter the cache - a sentinel-carrying
+  /// axis keeps its cached value ([`merge_bounds_into_cache`]) - so a cached
+  /// component reflects only the last real write through the builder or
+  /// `set_bounds`.
   ///
   /// # Render semantics (openspec ohos-webview-sizing)
   ///
@@ -1547,7 +1611,10 @@ impl InnerWebView {
     let (x, y) = geometry_to_logical_vp(bounds.position, vp);
     let (w, h) = size_to_logical_vp(bounds.size, vp);
     self.dispatch_or_queue(PendingOp::SetBounds(x, y, w, h))?;
-    *self.bounds_cache.lock().unwrap() = bounds;
+    // ability-F6: the cache write skips sentinel components (the tauri
+    // -runtime-wry partial-bounds wire, issue Eulogizethesun/tauri#241), so
+    // `bounds()` readers must never see -2147483648.0 as a real component.
+    merge_bounds_into_cache(&mut self.bounds_cache.lock().unwrap(), bounds);
     Ok(())
   }
 
@@ -2919,6 +2986,86 @@ mod tests {
       runtime.pump_thread_alive(),
       "a fresh bridge runtime must report a live pump thread"
     );
+  }
+
+  // ability-F6 (PR#26 review gate): tauri-runtime-wry's partial set_bounds
+  // requests (issue Eulogizethesun/tauri#241) carry the i32::MIN sentinel for
+  // the components a call does not set. The public bounds cache must never
+  // hold the sentinel: bounds() readers would otherwise read back
+  // -2147483648.0 as a real position/size component.
+
+  /// ability-F6: `merge_bounds_into_cache` is the exact cache write of
+  /// `set_bounds`, so what it leaves in the cache is what `bounds()` reads
+  /// back. A sentinel-carrying axis keeps its cached value; an axis with only
+  /// real components is replaced; a full request still replaces the cache
+  /// wholesale (the pre-fix behavior must survive for full writes).
+  /// # Brief: 1) seed the cache with the builder-default placeholder 2) merge
+  /// a SetSize-shaped partial (sentinel position pair) 3) assert no -2^31
+  /// component, preserved position, applied size 4) merge a SetPosition-shaped
+  /// partial 5) merge a full request and assert the wholesale replace.
+  #[test]
+  fn ut_set_bounds_sentinel_components_never_enter_the_bounds_cache() {
+    fn components(r: &Rect) -> (f64, f64, f64, f64) {
+      let (px, py) = position_components(r.position);
+      let (pw, ph) = size_components(r.size);
+      (px, py, pw, ph)
+    }
+
+    let sentinel = i32::MIN as f64;
+
+    // Seed: the builder-default placeholder a webview starts from.
+    let mut cache = Rect {
+      position: dpi::LogicalPosition::new(0.0, 0.0).into(),
+      size: dpi::LogicalSize::new(200.0, 200.0).into(),
+    };
+
+    // SetSize-shaped partial (tauri-runtime-wry issue #241): the unset
+    // position rides as the sentinel pair, the size is real.
+    merge_bounds_into_cache(
+      &mut cache,
+      Rect {
+        position: dpi::LogicalPosition::new(sentinel, sentinel).into(),
+        size: dpi::LogicalSize::new(320.0, 240.0).into(),
+      },
+    );
+    let (x, y, w, h) = components(&cache);
+    assert_ne!(x, sentinel, "sentinel x must not enter the bounds cache");
+    assert_ne!(y, sentinel, "sentinel y must not enter the bounds cache");
+    assert_eq!(x, 0.0, "sentinel position keeps the cached value");
+    assert_eq!(y, 0.0, "sentinel position keeps the cached value");
+    assert_eq!(w, 320.0, "real size overwrites the cache");
+    assert_eq!(h, 240.0, "real size overwrites the cache");
+
+    // SetPosition-shaped partial: real position, sentinel size pair.
+    merge_bounds_into_cache(
+      &mut cache,
+      Rect {
+        position: dpi::LogicalPosition::new(15.0, 25.0).into(),
+        size: dpi::LogicalSize::new(sentinel, sentinel).into(),
+      },
+    );
+    let (x, y, w, h) = components(&cache);
+    assert_ne!(w, sentinel, "sentinel width must not enter the cache");
+    assert_ne!(h, sentinel, "sentinel height must not enter the cache");
+    assert_eq!(x, 15.0, "real position overwrites the cache");
+    assert_eq!(y, 25.0, "real position overwrites the cache");
+    assert_eq!(w, 320.0, "sentinel size keeps the cached value");
+    assert_eq!(h, 240.0, "sentinel size keeps the cached value");
+
+    // Control: a full request (no sentinel component) replaces the cache
+    // wholesale, including across variants.
+    merge_bounds_into_cache(
+      &mut cache,
+      Rect {
+        position: dpi::PhysicalPosition::new(5_i32, 6_i32).into(),
+        size: dpi::PhysicalSize::new(7_u32, 8_u32).into(),
+      },
+    );
+    let (x, y, w, h) = components(&cache);
+    assert_eq!(x, 5.0, "a full request replaces the position wholesale");
+    assert_eq!(y, 6.0, "a full request replaces the position wholesale");
+    assert_eq!(w, 7.0, "a full request replaces the size wholesale");
+    assert_eq!(h, 8.0, "a full request replaces the size wholesale");
   }
 
   // #189 (design D3): the unified dispose fence.
