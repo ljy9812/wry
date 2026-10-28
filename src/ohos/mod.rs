@@ -61,8 +61,9 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
 /// reports vp = 1.9, so physical px is divided by vp before it reaches ArkUI
 /// vp units. Where the binding is absent (host builds and unit tests) the
 /// fallback is 1.0 — there the division is an identity and UT numbers stay
-/// bit-identical; that fallback value is NOT the ratio of any real OHOS
-/// device.
+/// bit-identical. That 1.0 is the code's stub for the absent-binding case,
+/// not a measured figure; the only measured device figure quoted here is the
+/// reference device's vp = 1.9.
 pub(crate) fn vp_ratio_sanitized(vp: f64) -> f64 {
   if vp.is_finite() && vp > 0.0 {
     vp
@@ -414,7 +415,10 @@ fn devtools_close_intent() -> bool {
 /// idempotence fence, so a latched `true` would permanently swallow every
 /// later `open_devtools` in this process. Same policy as
 /// [`failed_create_cleanup`] for a queued open that can never replay.
-/// Factored out so the host UT exercises the real failure path.
+/// Factored out so the device UT exercises the real failure path.
+/// Device-gated: `src/ohos` is entirely `#[cfg(target_env = "ohos")]`, so its
+/// UTs are only compiled and executed when the crate targets
+/// aarch64-unknown-linux-ohos; a host `cargo test` never builds them.
 ///
 /// Race note (inherent to the async latch, identical to
 /// [`failed_create_cleanup`]): a concurrent `open_devtools` that consulted the
@@ -473,7 +477,8 @@ pub(crate) struct InnerWebView {
 /// Ownership is exact: the queued open only exists when THIS webview flipped
 /// the intent (an earlier applied open makes `open_devtools` an early-return
 /// idempotent no-op, never a queue entry). Factored out of the create-failure
-/// closure so the host UT exercises the real cleanup.
+/// closure so the device UT exercises the real cleanup (device-gated: only
+/// compiled and executed when targeting aarch64-unknown-linux-ohos).
 fn failed_create_cleanup(guard: &mut Vec<PendingOp>) {
   #[cfg(any(debug_assertions, feature = "devtools"))]
   if guard.iter().any(|op| matches!(op, PendingOp::SetDevtools)) {
@@ -484,7 +489,7 @@ fn failed_create_cleanup(guard: &mut Vec<PendingOp>) {
 }
 
 /// PR review fix W1: the pre-handshake open queue attempt, factored out of
-/// [`InnerWebView::open_devtools`]'s `None` arm so the host UT exercises the
+/// [`InnerWebView::open_devtools`]'s `None` arm so the device UT exercises the
 /// REAL open_devtools-layer failure handling (not just `dispatch_or_queue_op`).
 /// Mirrors the m5 [`failed_create_cleanup`] semantics: when the queue is dead
 /// (creation already failed) the queued open can never replay, so the
@@ -516,7 +521,7 @@ fn queue_pre_handshake_open(
 }
 
 /// m4: the dispatch-or-queue decision + enqueue, factored out of the inherent
-/// method so the host UT exercises the REAL production path (queue /
+/// method so the device UT exercises the REAL production path (queue /
 /// creation-failed / ready branches) instead of pushing into a scratch Vec.
 /// The parameters are exactly the `InnerWebView` fields the method touches —
 /// no test-only seam. **TOCTOU guard** (unchanged): the `pending_ops` lock must
@@ -1967,6 +1972,10 @@ fn parse_cookie_string(cookie_str: &str) -> Vec<Cookie<'static>> {
 
 #[cfg(test)]
 mod tests {
+  // Device-gated: `src/ohos` is entirely `#[cfg(target_env = "ohos")]`, so the
+  // UTs below are only compiled and executed when the crate targets
+  // aarch64-unknown-linux-ohos. A host `cargo test` never builds them;
+  // receipts for these tests must come from a device-target test binary run.
   use super::*;
   use cookie::SameSite;
 
@@ -2815,7 +2824,8 @@ mod tests {
   /// `PendingOp::SetDevtools` replay — releases the process-level open intent
   /// through the REAL shared failure handler, so one failure can never latch
   /// the idempotence gate and swallow every later open_devtools in the
-  /// process.
+  /// process. Device-gated: this UT only compiles and executes when targeting
+  /// aarch64-unknown-linux-ohos (`src/ohos` never builds on a host).
   /// # Brief: 1) flip the intent 2) run the real `devtools_open_failed` 3)
   /// assert the intent is released and a later open dispatches again.
   #[cfg(any(debug_assertions, feature = "devtools"))]
