@@ -56,11 +56,11 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
 /// (`create` child bounds and [`InnerWebView::set_bounds`]). Thin wrapper over
 /// the ability binding `openharmony_ability::virtual_pixel_ratio` (which
 /// already falls back to 1.0 on a <=0/absent binding); this second guard keeps
-/// the f32→f64 widening total so geometry conversion never divides by zero or
+/// the f32->f64 widening total so geometry conversion never divides by zero or
 /// NaN. The live ratio is device-real: the OHOS desktop reference device
 /// reports vp = 1.9, so physical px is divided by vp before it reaches ArkUI
 /// vp units. Where the binding is absent (host builds and unit tests) the
-/// fallback is 1.0 — there the division is an identity and UT numbers stay
+/// fallback is 1.0 -- there the division is an identity and UT numbers stay
 /// bit-identical. That 1.0 is the code's stub for the absent-binding case,
 /// not a measured figure; the only measured device figure quoted here is the
 /// reference device's vp = 1.9.
@@ -76,7 +76,7 @@ pub(crate) fn virtual_pixel_ratio() -> f64 {
   vp_ratio_sanitized(openharmony_ability::virtual_pixel_ratio() as f64)
 }
 
-/// #198: the physical→ArkUI-vp conversion applied to webview geometry
+/// #198: the physical->ArkUI-vp conversion applied to webview geometry
 /// positions, through `dpi`'s `to_logical` (a `Physical` input is divided by
 /// `vp`; a `Logical` input is an identity). A named fn keeps the
 /// vp=1-identity / vp=2-halving contract unit-testable without a live
@@ -120,7 +120,7 @@ pub(crate) fn size_to_logical_vp(value: dpi::Size, vp: f64) -> (f64, f64) {
   value.to_logical::<f64>(vp).into()
 }
 
-// ─── ability-F6: sentinel-safe bounds cache merge ────────────────────────────────
+// --- ability-F6: sentinel-safe bounds cache merge --------------------------------
 
 /// The "component not set by this call" sentinel of the cross-repo OHOS wire
 /// contract (tauri-runtime-wry `OHOS_BOUNDS_UNSET`, issue
@@ -269,7 +269,7 @@ fn merge_bounds_into_cache(cache: &mut Rect, incoming: Rect) {
 }
 
 /// #189: the disposal idempotence fence shared by `dispose_child` and `Drop`.
-/// Returns `true` exactly once per webview — the first caller wins and owes
+/// Returns `true` exactly once per webview -- the first caller wins and owes
 /// the `Remove` dispatch; every later call (including a double Drop) is a
 /// no-op. Main and child webviews share this path: the old `is_child` gate
 /// that let main webviews leak their ArkTS component is gone.
@@ -277,14 +277,14 @@ fn dispose_once(disposed: &AtomicBool) -> bool {
   !disposed.swap(true, Ordering::SeqCst)
 }
 
-// ─── #192: url() three-state main-thread sync refresh ───────────────────────────
+// --- #192: url() three-state main-thread sync refresh ---------------------------
 
 /// Refreshes `cache` from the live controller URL through the `ohos.webview-url`
 /// main-thread sync bridge (ArkTS `getUrlSync`). Runs ONLY on the NAPI main
-/// thread — the MainThreadSync bridge contract (`with_main_thread_bridge` is a
+/// thread -- the MainThreadSync bridge contract (`with_main_thread_bridge` is a
 /// re-entrant direct call, so there is no timeout construct on this path at
-/// all: zero recv_timeout, zero block_on). Any failure — sync app not
-/// registered, main-thread Env gone, bridge error — keeps the cached value
+/// all: zero recv_timeout, zero block_on). Any failure -- sync app not
+/// registered, main-thread Env gone, bridge error -- keeps the cached value
 /// with a debug log: `url()` never fails just because the sync bridge does.
 fn refresh_url_cache_from_bridge(webview_id: &str, cache: &Mutex<String>) {
   match openharmony_ability_plugin_webview::webview_url_on_main_thread(webview_id) {
@@ -296,15 +296,15 @@ fn refresh_url_cache_from_bridge(webview_id: &str, cache: &Mutex<String>) {
 /// #192 (design D4): three-state router behind [`InnerWebView::url`], mirroring
 /// the `cookies_for_url` main-thread classification:
 ///
-/// 1. **Main** — the async bridge is unusable on the main thread (its TSFN
+/// 1. **Main** -- the async bridge is unusable on the main thread (its TSFN
 ///    response needs this very thread to pump), so the URL is refreshed
 ///    synchronously through the dedicated `ohos.webview-url` MainThreadSync
 ///    plugin and written back to the cache. This closes the stale-cache gap
 ///    after SPA pushState navigation, which the page-begin/end event cache
 ///    never observes.
-/// 2. **Worker** — zero bridge traffic: return the cache (prefilled with the
+/// 2. **Worker** -- zero bridge traffic: return the cache (prefilled with the
 ///    initial URL at creation, updated by page events).
-/// 3. **Uninitialized** (render entry not yet run) — thread classification is
+/// 3. **Uninitialized** (render entry not yet run) -- thread classification is
 ///    impossible, so no bridge call is safe either way: return the cache.
 ///
 /// No path blocks: the only bridge touch is the re-entrant MainThreadSync
@@ -484,7 +484,7 @@ enum PendingOp {
     Option<Box<dyn Fn(bool) + Send + 'static>>,
   ),
   Remove,
-  /// #195: queued open_devtools — `setWebDebuggingAccess(true)` issued while
+  /// #195: queued open_devtools -- `setWebDebuggingAccess(true)` issued while
   /// create was still pending, replayed by the create drain once the handshake
   /// completes. Only the open intent is queued (design D5); the process-level
   /// [`DEVTOOLS_ENABLED`] flag keeps repeat opens idempotent.
@@ -562,7 +562,7 @@ impl PendingOp {
         if let Err(e) = &result {
           log::warn!("[wry] pending evaluate_script failed: {}", e);
         }
-        // #194: the callback is invoked for both outcomes — an eval failure
+        // #194: the callback is invoked for both outcomes -- an eval failure
         // settles with the literal "null" instead of leaving the awaiting
         // promise pending forever.
         if let Some(cb) = callback {
@@ -587,8 +587,8 @@ impl PendingOp {
         // process-level DEVTOOLS_ENABLED flag was already set at the call
         // site, so this only needs the runtime channel.
         if let Err(e) = handle.set_web_debugging_access(true).await {
-          // W26-4: this queued op is consumed either way — it can never be
-          // retried — so a failed replay must release the intent. Leaving it
+          // W26-4: this queued op is consumed either way -- it can never be
+          // retried -- so a failed replay must release the intent. Leaving it
           // latched would make the idempotence gate swallow every later
           // open_devtools in this process (same policy as
           // `failed_create_cleanup` for never-replayable queued opens).
@@ -601,16 +601,16 @@ impl PendingOp {
 
 /// #195: process-level "devtools enabled" intent. ArkWeb
 /// `setWebDebuggingAccess` is a process-static API, so the intent is recorded
-/// here at the call site — even while create is still pending and the runtime
-/// channel is unreachable — and kept in sync on close. It is also the
+/// here at the call site -- even while create is still pending and the runtime
+/// channel is unreachable -- and kept in sync on close. It is also the
 /// idempotence fence: an already-enabled flag means a prior open is queued
 /// (or applied), so repeat opens dispatch nothing new.
 ///
 /// W26-4: because the flag doubles as the idempotence fence, every dead or
-/// failed open path releases it again — a dead queue
+/// failed open path releases it again -- a dead queue
 /// ([`queue_pre_handshake_open`]), a failed create
 /// ([`failed_create_cleanup`]), a failed replay (`PendingOp::SetDevtools`)
-/// and a failed ready-branch dispatch ([`devtools_open_failed`]) — so a
+/// and a failed ready-branch dispatch ([`devtools_open_failed`]) -- so a
 /// single failure can never block all later opens in the process.
 ///
 /// Gate F5: the ready-branch dispatch additionally releases the intent when
@@ -624,7 +624,7 @@ static DEVTOOLS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// #195: records the open intent and reports whether a dispatch/queue is
 /// still owed (`true` = this call flipped the flag, so dispatch; `false` =
-/// an open is already queued or applied — idempotent no-op).
+/// an open is already queued or applied -- idempotent no-op).
 #[cfg(any(debug_assertions, feature = "devtools"))]
 fn devtools_open_intent() -> bool {
   !DEVTOOLS_ENABLED.swap(true, Ordering::SeqCst)
@@ -637,7 +637,7 @@ fn devtools_close_intent() -> bool {
   DEVTOOLS_ENABLED.swap(false, Ordering::SeqCst)
 }
 
-/// W26-4: shared failure handling for the two async enable paths — the
+/// W26-4: shared failure handling for the two async enable paths -- the
 /// ready-branch dispatch ([`InnerWebView::open_devtools`]) and the
 /// `PendingOp::SetDevtools` replay. A failed `set_web_debugging_access(true)`
 /// must release the process-level open intent: the flag is also the
@@ -652,7 +652,7 @@ fn devtools_close_intent() -> bool {
 /// Race note (inherent to the async latch, identical to
 /// [`failed_create_cleanup`]): a concurrent `open_devtools` that consulted the
 /// still-latched flag before this release runs is not re-dispatched
-/// automatically — the next `open_devtools` call after the release does
+/// automatically -- the next `open_devtools` call after the release does
 /// dispatch again.
 #[cfg(any(debug_assertions, feature = "devtools"))]
 fn devtools_open_failed(context: &str, e: &dyn std::fmt::Display) {
@@ -696,16 +696,16 @@ pub(crate) struct InnerWebView {
   devtools_open: AtomicBool,
   /// #188: the creation-time incognito flag (`WebViewAttributes.incognito`).
   /// The main-thread `cookies_for_url` sync bridge is id-less, so the store
-  /// selector has to travel with the caller — retained here and passed to
+  /// selector has to travel with the caller -- retained here and passed to
   /// `cookies_for_url_on_main_thread(url, incognito)`.
   incognito: bool,
-  // #189: the `is_child` field was removed — disposal is now unified for main
+  // #189: the `is_child` field was removed -- disposal is now unified for main
   // and child webviews ([`InnerWebView::dispose_child`]); child-only behavior
   // that remains (initial bounds conversion) uses the `new_inner` parameter.
   disposed: AtomicBool,
 }
 
-/// m5: failed-create cleanup — a queued `SetDevtools` can never replay once
+/// m5: failed-create cleanup -- a queued `SetDevtools` can never replay once
 /// creation failed, so the process-level open intent must be released (a later
 /// webview's `open_devtools` dispatches again instead of silently no-oping).
 /// Ownership is exact: the queued open only exists when THIS webview flipped
@@ -718,7 +718,7 @@ fn failed_create_cleanup(guard: &mut Vec<PendingOp>) {
   if guard.iter().any(|op| matches!(op, PendingOp::SetDevtools)) {
     devtools_close_intent();
   }
-  // Queued ops can never execute — drop them.
+  // Queued ops can never execute -- drop them.
   guard.clear();
 }
 
@@ -727,7 +727,7 @@ fn failed_create_cleanup(guard: &mut Vec<PendingOp>) {
 /// REAL open_devtools-layer failure handling (not just `dispatch_or_queue_op`).
 /// Mirrors the m5 [`failed_create_cleanup`] semantics: when the queue is dead
 /// (creation already failed) the queued open can never replay, so the
-/// just-recorded process-level open intent must be released — otherwise
+/// just-recorded process-level open intent must be released -- otherwise
 /// `DEVTOOLS_ENABLED` latches `true` for the whole process and every later
 /// webview's `open_devtools` silently no-ops forever.
 #[cfg(any(debug_assertions, feature = "devtools"))]
@@ -757,13 +757,13 @@ fn queue_pre_handshake_open(
 /// m4: the dispatch-or-queue decision + enqueue, factored out of the inherent
 /// method so the device UT exercises the REAL production path (queue /
 /// creation-failed / ready branches) instead of pushing into a scratch Vec.
-/// The parameters are exactly the `InnerWebView` fields the method touches —
+/// The parameters are exactly the `InnerWebView` fields the method touches --
 /// no test-only seam. **TOCTOU guard** (unchanged): the `pending_ops` lock must
 /// be held when checking `handle.get()` and when pushing the queued op.
 ///
 /// Gate F2 (PR#26 review round 2): the queue arm refuses an op when the
-/// bridge runtime's pump thread is already dead — a queued op replays only
-/// through the create drain, which is itself polled by that very thread — so
+/// bridge runtime's pump thread is already dead -- a queued op replays only
+/// through the create drain, which is itself polled by that very thread -- so
 /// the op surfaces an Err synchronously instead of sitting in a queue that
 /// never drains. For the devtools open this Err is what makes
 /// [`queue_pre_handshake_open`] release the process-level intent (making the
@@ -778,7 +778,7 @@ fn dispatch_or_queue_op(
 ) -> Result<()> {
   let mut guard = pending_ops.lock().unwrap();
   if let Some(handle) = handle.get() {
-    // Handle is ready — release lock and spawn
+    // Handle is ready -- release lock and spawn
     let handle = handle.clone();
     drop(guard);
     runtime.spawn(async move {
@@ -798,7 +798,7 @@ fn dispatch_or_queue_op(
       "bridge runtime pump thread is dead; the queued op would never be replayed".into(),
     ))
   } else {
-    // Not ready — queue for replay after create
+    // Not ready -- queue for replay after create
     guard.push(op);
     Ok(())
   }
@@ -819,9 +819,9 @@ fn set_bounds_with_cache(
   bounds_cache: &Mutex<Rect>,
   bounds: Rect,
 ) -> Result<()> {
-  // #198: physical → ArkUI vp via the live display ratio (was a hardcoded
+  // #198: physical -> ArkUI vp via the live display ratio (was a hardcoded
   // 1.0; the absent-binding fallback 1.0 keeps host/UT values
-  // bit-identical — the desktop reference device reports vp=1.9).
+  // bit-identical -- the desktop reference device reports vp=1.9).
   let vp = virtual_pixel_ratio();
   let (x, y) = geometry_to_logical_vp(bounds.position, vp);
   let (w, h) = size_to_logical_vp(bounds.size, vp);
@@ -1083,7 +1083,7 @@ impl InnerWebView {
     // #199: pre-fill the URL cache with the (normalized) initial URL so the
     // first IPC invoke that arrives before navigation completes resolves
     // against the real page URL instead of the about:blank fallback. `url()`
-    // shares this cache — before navigation it now returns the initial URL
+    // shares this cache -- before navigation it now returns the initial URL
     // rather than an empty string (benign, more truthful).
     *url_cache.lock().unwrap() =
       url_cache_prefill(initial_url.as_deref(), use_https, &shared_for_intercept);
@@ -1094,7 +1094,7 @@ impl InnerWebView {
       let https_protocols = shared_for_intercept.clone();
       callbacks_builder = callbacks_builder.on_https_intercept_request(move |req| {
         // #186: forward the intercepted request's method + parallel header
-        // arrays when the ArkTS plugin sent them (None on older plugins —
+        // arrays when the ArkTS plugin sent them (None on older plugins --
         // the builder then keeps the historical GET/no-headers shape).
         dispatch_https_intercept_sync(
           &req.url,
@@ -1273,7 +1273,7 @@ impl InnerWebView {
         visible: Some(visible),
         // #188 (design D9): forward the incognito flag through the new
         // `WebviewStyle.incognito` wire field (Option<bool>,
-        // skip-serialized): `true` maps to `Some(true)` — the ArkTS receiver
+        // skip-serialized): `true` maps to `Some(true)` -- the ArkTS receiver
         // sets `Web().incognitoMode(true)` (SDK20 @since 20) and carries the
         // flag to the cookie sync bridge as its third parameter; the default
         // `false` stays `None`, keeping the payload byte-identical to the
@@ -1338,9 +1338,9 @@ impl InnerWebView {
 
     // For child webviews with bounds, set initial style position/size.
     if is_child && bounds.is_some() {
-      // #198: physical → ArkUI vp via the live display ratio (was a hardcoded
-      // 1.0 — a vp≠1 device now lands geometry in vp units; the
-      // absent-binding fallback 1.0 — host builds / UTs — is an unchanged
+      // #198: physical -> ArkUI vp via the live display ratio (was a hardcoded
+      // 1.0 -- a vp!=1 device now lands geometry in vp units; the
+      // absent-binding fallback 1.0 -- host builds / UTs -- is an unchanged
       // identity, while the desktop reference device reports vp=1.9).
       let vp = virtual_pixel_ratio();
       let (x, y) = geometry_to_logical_vp(initial_bounds.position, vp);
@@ -1431,7 +1431,7 @@ impl InnerWebView {
           log::error!("[wry] WebviewClient::create() failed: {}", error_str);
           let mut guard = pending_ops_for_create.lock().unwrap();
           *creation_error_for_create.lock().unwrap() = Some(error_str);
-          // m5: a queued `SetDevtools` can never replay after a failed create —
+          // m5: a queued `SetDevtools` can never replay after a failed create --
           // release the process-level open intent so a later webview's
           // `open_devtools` dispatches again instead of silently no-oping
           // (see `failed_create_cleanup`).
@@ -1580,7 +1580,7 @@ impl InnerWebView {
   // Devtools: bridge action
   //
   // #195: previously a pre-handshake open was silently dropped (`try_handle`
-  // → None) — tauri-runtime-wry calls open_devtools right after creation, so
+  // -> None) -- tauri-runtime-wry calls open_devtools right after creation, so
   // on the OHOS delayed-attach path the intent vanished. Now the intent is
   // recorded in the process-level flag first, and a pre-handshake open is
   // queued as `PendingOp::SetDevtools` for the create drain to replay.
@@ -1613,7 +1613,7 @@ impl InnerWebView {
       Some(handle) => {
         self.runtime.spawn(async move {
           if let Err(e) = handle.set_web_debugging_access(true).await {
-            // W26-4: a failed enable must not latch the idempotence gate —
+            // W26-4: a failed enable must not latch the idempotence gate --
             // release the intent so a later open dispatches again.
             devtools_open_failed("open_devtools", &e);
           }
@@ -1659,7 +1659,7 @@ impl InnerWebView {
   // #195: close clears the process-level intent (so a later open can dispatch
   // again) and uses the runtime channel when ready. Edge note: a close issued
   // while an open is still queued cannot retro-cancel that queued op (design
-  // D5 keeps a single variant) — the replayed open wins; close again after the
+  // D5 keeps a single variant) -- the replayed open wins; close again after the
   // handshake to actually turn it off.
   #[cfg(any(debug_assertions, feature = "devtools"))]
   pub fn close_devtools(&self) {
@@ -1741,7 +1741,7 @@ impl InnerWebView {
         // Fetch synchronously through the dedicated `ohos.webview-cookie`
         // MainThreadSync plugin (ArkTS `fetchCookieSync`) instead. Returns
         // the real cookies rather than the old silent empty (issue #110).
-        // #188: the incognito flag rides along — the sync request is
+        // #188: the incognito flag rides along -- the sync request is
         // id-less, so without it the ArkTS side could only ever read the
         // default store and an incognito webview's main-thread probe would
         // silently observe non-incognito cookies.
@@ -1859,11 +1859,11 @@ impl InnerWebView {
   ///
   /// [`Self::set_bounds`] converts window physical coordinates into ArkUI vp
   /// units through the live display virtual-pixel ratio
-  /// ([`virtual_pixel_ratio`], #198 — previously a hardcoded 1.0). The live
+  /// ([`virtual_pixel_ratio`], #198 -- previously a hardcoded 1.0). The live
   /// ratio is device-real: the OHOS desktop reference device reports
   /// vp = 1.9, so physical px is divided by vp before it reaches ArkUI (the
   /// historical full-stack "physical px == vp" assumption held only where
-  /// the binding is absent and the fallback 1.0 applies — host builds and
+  /// the binding is absent and the fallback 1.0 applies -- host builds and
   /// unit tests, where the conversion is an identity and UT numbers stay
   /// bit-identical). Logical-coordinate input passes through
   /// `dpi::Position::to_logical` unchanged regardless of vp.
@@ -1873,16 +1873,16 @@ impl InnerWebView {
   /// The value is cache-only: written at creation (builder bounds) and on
   /// every `set_bounds` (except the dead-pump branch of `set_bounds`, which
   /// warns and leaves the cache unchanged). `wry` itself never refreshes it
-  /// on window resizes — freshness depends entirely on the embedding
+  /// on window resizes -- freshness depends entirely on the embedding
   /// runtime re-issuing `set_bounds`, which tauri-runtime-wry does on window
   /// resize only through its autoresize flow (that re-issued call writes
   /// this cache).
   /// Without that flow the cache goes stale as the window resizes.
   ///
   /// ArkUI-initiated layout changes DO occur and are NOT observed (no bridge
-  /// writeback exists): a natural-layout webview follows container layout —
+  /// writeback exists): a natural-layout webview follows container layout --
   /// window resizes move and resize its ArkTS node with no `set_bounds`
-  /// call — so the cache can go stale without any write from the runtime.
+  /// call -- so the cache can go stale without any write from the runtime.
   /// The value is therefore the last written bounds, never the live
   /// geometry.
   ///
@@ -1913,7 +1913,7 @@ impl InnerWebView {
   ///
   /// The ArkTS render layer consumes the full geometry: a create request with
   /// explicit bounds renders the webview at the requested size (not inflated
-  /// to the container), and a runtime `set_bounds` applies position AND size —
+  /// to the container), and a runtime `set_bounds` applies position AND size --
   /// flipping a natural-layout (bounds-less) webview away from container
   /// following. A bounds-less webview keeps natural layout: the wrapper renders
   /// at "100%" and follows window resizes through container layout.
@@ -1950,7 +1950,7 @@ impl InnerWebView {
 
   /// Removes this webview's ArkTS `Web` component. Unified for main AND child
   /// webviews (committer #189): the previous `self.is_child &&` gate skipped
-  /// disposal for main webviews, leaking the ArkTS Web component on Drop —
+  /// disposal for main webviews, leaking the ArkTS Web component on Drop --
   /// the "leftover fullscreen transparent window eats clicks" family. The
   /// first caller wins via the `disposed` swap (idempotent); `Drop` funnels
   /// through here too, so the dispatch result is deliberately ignored (on the
@@ -2060,15 +2060,15 @@ pub fn platform_webview_version() -> Result<String> {
 ///
 /// #186: the intercepted request's method and headers are carried through from
 /// the ArkTS interceptor (`WebResourceRequest.getRequestMethod()`/`getRequestHeader()`,
-/// parallel same-order name/value arrays on the NAPI wire). `None` — the shape
-/// older bridge plugins send — keeps the previous request shape (method=GET,
+/// parallel same-order name/value arrays on the NAPI wire). `None` -- the shape
+/// older bridge plugins send -- keeps the previous request shape (method=GET,
 /// no headers), so old ArkTS plugins stay compatible. A malformed method falls
 /// back to GET; a single malformed header (name/value not a legal HTTP token)
 /// is skipped with a debug log rather than failing the whole request. The
 /// request body is NOT forwarded: the OHOS platform exposes no accessor for
 /// it (disclosed in ohos-platform-limitations). W26-5: the body-framing
 /// headers `content-length` and `transfer-encoding` are dropped from the
-/// forwarded set (case-insensitively) — the rebuilt request's body is always
+/// forwarded set (case-insensitively) -- the rebuilt request's body is always
 /// empty, so forwarding a stale framing header would make a downstream
 /// consumer wait for body bytes (or a chunked terminator) that never arrive.
 fn dispatch_https_intercept_sync(
@@ -2135,12 +2135,12 @@ fn dispatch_https_intercept_sync(
       let parsed_name = http::HeaderName::from_bytes(name.as_bytes());
       let value_ok = http::HeaderValue::from_str(value).is_ok();
       if parsed_name.is_err() || !value_ok {
-        // One bad header must not sink the request — skip it.
+        // One bad header must not sink the request -- skip it.
         log::debug!("[wry https-intercept] skipping invalid header '{name}': '{value}'");
         continue;
       }
       // W26-5: the body is never forwarded (always empty), so body-framing
-      // headers must not be forwarded either — a stale `content-length` /
+      // headers must not be forwarded either -- a stale `content-length` /
       // `transfer-encoding` would make a downstream consumer wait for body
       // bytes that never arrive. Dropped case-insensitively via the parsed
       // (lowercased) name.
@@ -2207,7 +2207,7 @@ fn dispatch_https_intercept_sync(
       // #186 (fix-variant M1): forward the protocol handler's response headers
       // to ArkTS (`WebResourceResponse.setResponseHeader`). Content-Type is
       // carried by `mime_type` and never duplicated (double-application risk in
-      // ArkWeb); non-UTF-8 headers are skipped individually — the same
+      // ArkWeb); non-UTF-8 headers are skipped individually -- the same
       // degrade-safely rule as the request direction. An empty set stays `None`
       // so headerless responses keep the pre-M1 wire shape (D9).
       let mut header_names: Vec<String> = Vec::new();
@@ -2216,7 +2216,7 @@ fn dispatch_https_intercept_sync(
         if name.as_str().eq_ignore_ascii_case("content-type") {
           continue;
         }
-        // HeaderName is ASCII by construction (http crate) — only the value
+        // HeaderName is ASCII by construction (http crate) -- only the value
         // can carry non-UTF-8/opaque bytes. Mirrors the request-side
         // extraction at the wire build site below.
         let name_str = name.as_str();
@@ -2302,9 +2302,9 @@ fn headers_to_btree(headers: &http::HeaderMap) -> std::collections::BTreeMap<Str
     .collect()
 }
 
-/// Formats an `OffsetDateTime` as an RFC 6265 §5.1.1 IMF-fixdate string in
+/// Formats an `OffsetDateTime` as an RFC 6265 section 5.1.1 IMF-fixdate string in
 /// UTC (e.g. `Thu, 01 Jan 2026 00:00:00 GMT`). Note IMF-fixdate is NOT the
-/// same as RFC 2822 (`+0000` suffix etc.) — ArkWeb expects the fixed form.
+/// same as RFC 2822 (`+0000` suffix etc.) -- ArkWeb expects the fixed form.
 fn format_imf_fixdate(dt: cookie::time::OffsetDateTime) -> String {
   use cookie::time::UtcOffset;
   const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -2333,9 +2333,9 @@ fn format_set_cookie_value(cookie: &Cookie<'_>) -> String {
   if let Some(p) = cookie.path() {
     value.push_str(&format!("; Path={}", p));
   }
-  // Persistence attributes (#190①): emit Expires (IMF-fixdate) and Max-Age so
+  // Persistence attributes (#190(1)): emit Expires (IMF-fixdate) and Max-Age so
   // a persistent cookie does not degrade to a session cookie in ArkWeb. When
-  // both are present RFC 6265 §5.3 prefers Max-Age — both are emitted here and
+  // both are present RFC 6265 section 5.3 prefers Max-Age -- both are emitted here and
   // the receiving system applies the precedence. Session cookies carry neither.
   if let Some(cookie::Expiration::DateTime(dt)) = cookie.expires() {
     value.push_str(&format!("; Expires={}", format_imf_fixdate(dt)));
@@ -2356,7 +2356,7 @@ fn format_set_cookie_value(cookie: &Cookie<'_>) -> String {
 }
 
 /// Resolves the eval-callback payload for an evaluation outcome (#194).
-/// Success keeps the existing semantics (result text; `None` → empty), while
+/// Success keeps the existing semantics (result text; `None` -> empty), while
 /// a failure yields the literal `"null"` so the awaiting promise settles
 /// instead of hanging forever.
 fn eval_callback_payload<E>(result: &std::result::Result<Option<String>, E>) -> String {
@@ -2410,7 +2410,7 @@ mod tests {
   use cookie::SameSite;
 
   // PR review fix W3: UTs that rewrite the process-level `DEVTOOLS_ENABLED`
-  // flag must not interleave — the harness runs them on multiple threads and
+  // flag must not interleave -- the harness runs them on multiple threads and
   // unsynchronized save/store/restore sequences would flip each other's state
   // mid-assert (intermittent false reds). Every DEVTOOLS_ENABLED-touching UT
   // holds this mutex for its whole body.
@@ -2446,11 +2446,11 @@ mod tests {
     assert_eq!(format_set_cookie_value(&cookie), "k=v");
   }
 
-  // #190①: persistence attributes survive the Set-Cookie formatting so a
+  // #190(1): persistence attributes survive the Set-Cookie formatting so a
   // persistent cookie does not degrade to a session cookie in ArkWeb.
 
-  /// UT for #190①: an expiration datetime is emitted as an IMF-fixdate
-  /// `Expires` in UTC (RFC 6265 §5.1.1), e.g. `Thu, 01 Jan 2026 00:00:00 GMT`.
+  /// UT for #190(1): an expiration datetime is emitted as an IMF-fixdate
+  /// `Expires` in UTC (RFC 6265 section 5.1.1), e.g. `Thu, 01 Jan 2026 00:00:00 GMT`.
   /// # Brief: build a cookie with a fixed expiry and assert the formatted
   /// attribute verbatim.
   #[test]
@@ -2467,7 +2467,7 @@ mod tests {
     );
   }
 
-  /// UT for #190①: a max-age duration is emitted as whole-second `Max-Age`.
+  /// UT for #190(1): a max-age duration is emitted as whole-second `Max-Age`.
   /// # Brief: build a cookie with max_age 3600s and assert `Max-Age=3600`.
   #[test]
   fn ut_format_set_cookie_value_max_age_whole_seconds() {
@@ -2476,11 +2476,11 @@ mod tests {
       .build();
     let v = format_set_cookie_value(&cookie);
     assert!(v.contains("; Max-Age=3600"), "Max-Age missing: {v}");
-    // Expiration came only from max_age — no `Expires` must be invented.
+    // Expiration came only from max_age -- no `Expires` must be invented.
     assert!(!v.contains("Expires="), "unexpected Expires: {v}");
   }
 
-  /// UT for #190①: a session cookie carries neither persistence attribute.
+  /// UT for #190(1): a session cookie carries neither persistence attribute.
   /// # Brief: build a bare cookie and assert both attributes are absent.
   #[test]
   fn ut_format_set_cookie_value_session_omits_both_attributes() {
@@ -2496,8 +2496,8 @@ mod tests {
     );
   }
 
-  /// UT for #190①: when both attributes are present both are emitted (the
-  /// RFC 6265 §5.3 Max-Age precedence is the receiving side's semantics).
+  /// UT for #190(1): when both attributes are present both are emitted (the
+  /// RFC 6265 section 5.3 Max-Age precedence is the receiving side's semantics).
   /// # Brief: build a cookie with expiry + max-age and assert both appear.
   #[test]
   fn ut_format_set_cookie_value_emits_both_when_both_given() {
@@ -2529,7 +2529,7 @@ mod tests {
   }
 
   /// UT for #194: successful evaluations keep the existing payload semantics
-  /// (result passed through, `None` → empty string).
+  /// (result passed through, `None` -> empty string).
   /// # Brief: feed `Ok` outcomes to the payload helper and assert both shapes.
   #[test]
   fn ut_eval_callback_payload_success_passthrough() {
@@ -2870,7 +2870,7 @@ mod tests {
     assert!(start.elapsed() < std::time::Duration::from_secs(3));
   }
 
-  // ─── p3 fix-variant M1: response header write path (#186) ──────────────────
+  // --- p3 fix-variant M1: response header write path (#186) ------------------
 
   /// UT for #186 M1: the protocol handler's response headers reach the wire
   /// struct as parallel arrays, with Content-Type excluded (it travels via
@@ -2927,7 +2927,7 @@ mod tests {
   }
 
   /// UT for #186 M1 + D9: a handler that only sets Content-Type keeps the old
-  /// wire shape — header arrays stay `None` (byte-identical default).
+  /// wire shape -- header arrays stay `None` (byte-identical default).
   /// # Brief: 1) dispatch a Content-Type-only response 2) assert both header
   /// arrays stay `None`.
   #[test]
@@ -2947,7 +2947,7 @@ mod tests {
     );
   }
 
-  // ─── p3 committer-issues batch: #189/#192/#195/#198 unit tests ─────────────
+  // --- p3 committer-issues batch: #189/#192/#195/#198 unit tests -------------
 
   // #198 (design D6): the vp conversion contract. Nothing here runs on the
   // host: `src/ohos` is device-gated and a host `cargo test` never builds
@@ -2958,7 +2958,7 @@ mod tests {
   // `vp_ratio_sanitized` wrapper.
 
   /// UT for #198: vp = 1.0 (the <=0/absent-binding fallback; the OHOS
-  /// desktop reference device reports vp = 1.9) is an identity —
+  /// desktop reference device reports vp = 1.9) is an identity --
   /// Physical(200,100) stays (200,100).
   /// # Brief: 1) convert a Physical position and size at ratio 1.0 2) assert
   /// both come back unchanged.
@@ -2976,7 +2976,7 @@ mod tests {
     );
   }
 
-  /// UT for #198: vp = 2.0 halves Physical(200,100) → (100,50), while a
+  /// UT for #198: vp = 2.0 halves Physical(200,100) -> (100,50), while a
   /// Logical input passes through unchanged (dpi identity contract).
   /// # Brief: 1) convert Physical position/size at ratio 2.0 and assert the
   /// halved values 2) convert a Logical input and assert it is unchanged.
@@ -3029,7 +3029,7 @@ mod tests {
     assert_eq!(y, 5.0);
   }
 
-  /// UT for #198: the wrapper's sanitize guard is deterministic — <=0, NaN and
+  /// UT for #198: the wrapper's sanitize guard is deterministic -- <=0, NaN and
   /// +/-inf fall back to exactly 1.0 (never a division hazard), real ratios pass
   /// through untouched. The LIVE binding value is device-real (1.9 on the
   /// desktop reference device), so the fallback contract is pinned on the pure
@@ -3058,7 +3058,7 @@ mod tests {
 
   // #192 (design D4): the url() three-state router.
 
-  /// UT for #192: Worker / Uninitialized states are cache-only — zero bridge
+  /// UT for #192: Worker / Uninitialized states are cache-only -- zero bridge
   /// traffic, the cached value comes back unchanged (and nothing blocks: the
   /// non-Main arms never touch the bridge at all).
   /// # Brief: 1) seed the cache 2) query in Worker then Uninitialized state
@@ -3077,7 +3077,7 @@ mod tests {
   }
 
   /// UT for #192: on the Main state a sync-bridge failure (host: the sync app
-  /// handle is never registered in tests) falls back to the cached value —
+  /// handle is never registered in tests) falls back to the cached value --
   /// url() neither fails nor blocks (the refresh is a re-entrant MainThreadSync
   /// direct call; no recv_timeout exists anywhere on the path).
   /// # Brief: 1) seed the cache 2) query in Main state with no sync bridge
@@ -3093,7 +3093,7 @@ mod tests {
 
   // #195 (design D5): the process-level devtools intent + queue replay.
 
-  /// UT for #195: the open intent flips exactly once — the first open reports
+  /// UT for #195: the open intent flips exactly once -- the first open reports
   /// "dispatch owed", repeat opens are idempotent no-ops, and close re-arms
   /// the flag so a later open dispatches again.
   /// # Brief: 1) reset the flag 2) assert the first open reports dispatch owed
@@ -3126,7 +3126,7 @@ mod tests {
   }
 
   /// UT for #195 + fix-variant m4: the pre-handshake open goes through the REAL
-  /// `dispatch_or_queue_op` path (the exact production fn, not a scratch Vec) —
+  /// `dispatch_or_queue_op` path (the exact production fn, not a scratch Vec) --
   /// queued in order while the handle is unset, rejected after a failed create
   /// (ops after failure must surface the error instead of queueing forever),
   /// and the create drain (`guard.drain(..)`, the Ok-branch semantics) empties
@@ -3225,7 +3225,7 @@ mod tests {
 
   /// PR review fix W1: the open_devtools LAYER (not just `dispatch_or_queue_op`)
   /// releases the just-recorded open intent when the queue is dead (create
-  /// already failed) — otherwise the process-level flag latches and every
+  /// already failed) -- otherwise the process-level flag latches and every
   /// later webview's open_devtools silently no-ops forever.
   /// # Brief: 1) flip the intent with the create already failed 2) run the
   /// real queue_pre_handshake_open 3) assert the intent was released and a
@@ -3244,7 +3244,7 @@ mod tests {
     let runtime = BridgeExecutor::new();
 
     // open_devtools' first step flips the intent; then the None arm hits the
-    // dead queue (create already failed — the m4 state dispatch rejects).
+    // dead queue (create already failed -- the m4 state dispatch rejects).
     assert!(devtools_open_intent(), "first open must flip the intent");
     *creation_error.lock().unwrap() = Some("injected create failure".to_string());
     queue_pre_handshake_open(&queue, &handle, &creation_error, &runtime);
@@ -3285,8 +3285,8 @@ mod tests {
     DEVTOOLS_ENABLED.store(saved, Ordering::SeqCst);
   }
 
-  /// W26-4: a failed async enable — the ready-branch dispatch or the
-  /// `PendingOp::SetDevtools` replay — releases the process-level open intent
+  /// W26-4: a failed async enable -- the ready-branch dispatch or the
+  /// `PendingOp::SetDevtools` replay -- releases the process-level open intent
   /// through the REAL shared failure handler, so one failure can never latch
   /// the idempotence gate and swallow every later open_devtools in the
   /// process. Device-gated: this UT only compiles and executes when targeting
@@ -3614,7 +3614,7 @@ mod tests {
 
   // #189 (design D3): the unified dispose fence.
 
-  /// UT for #189: the fence fires exactly once — a fresh webview owes the
+  /// UT for #189: the fence fires exactly once -- a fresh webview owes the
   /// `Remove` dispatch (main webviews included: the is_child gate is gone),
   /// and the second call (double Drop / double dispose) is a no-op.
   /// # Brief: 1) dispose three times 2) assert only the first reports a
@@ -3638,7 +3638,7 @@ mod tests {
   // arrays reach the protocol handler through the Request builder; missing
   // wire fields (older plugins) and malformed values degrade safely.
 
-  /// Capture handler: records `method=…`, `uri=…` and one `header:name=value`
+  /// Capture handler: records `method=...`, `uri=...` and one `header:name=value`
   /// line per received header, then responds inline.
   fn https_capture_handler(
     protocol: &str,
@@ -3698,7 +3698,7 @@ mod tests {
   }
 
   /// UT for W26-5: body-framing headers (`content-length` /
-  /// `transfer-encoding`) are dropped from the forwarded set — the rebuilt
+  /// `transfer-encoding`) are dropped from the forwarded set -- the rebuilt
   /// request's body is always empty, so forwarding a stale framing header
   /// would make a downstream consumer wait for body bytes that never arrive.
   /// Dropped case-insensitively; unrelated headers pass through untouched.
@@ -3739,7 +3739,7 @@ mod tests {
   }
 
   /// UT for #186: no wire fields (older ArkTS bridge plugins) keep the
-  /// historical shape — method defaults to GET and no headers are attached.
+  /// historical shape -- method defaults to GET and no headers are attached.
   /// # Brief: 1) dispatch with all wire fields absent 2) assert GET and zero
   /// headers on the handler's Request.
   #[test]
@@ -3773,7 +3773,7 @@ mod tests {
       "https://myproto.localhost/data",
       "w1",
       &https_capture_handler("myproto", Arc::clone(&captured)),
-      Some("BAD METHOD"), // space → Method::from_bytes fails → GET
+      Some("BAD METHOD"), // space -> Method::from_bytes fails -> GET
       Some(&["bad name".to_string(), "ok-name".to_string()]),
       Some(&["v1".to_string(), "v2".to_string()]),
     );

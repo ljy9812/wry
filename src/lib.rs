@@ -486,7 +486,7 @@ pub enum NewWindowResponse {
   /// **Windows**: The webview must use the same environment as the caller webview. See [`WebViewBuilderExtWindows::with_environment`].
   /// **macOS**: The webview must use the same configuration as the caller webview. See [`WebViewBuilderExtMacos::with_webview_configuration`].
   /// **OpenHarmony**: treated like [`NewWindowResponse::Deny`] for the ArkWeb
-  /// popup itself — tauri builds its own OS window and cancels ArkWeb's popup
+  /// popup itself -- tauri builds its own OS window and cancels ArkWeb's popup
   /// (see `with_new_window_req_handler`).
   #[cfg(not(any(target_os = "android", target_os = "ios")))]
   Create {
@@ -1031,7 +1031,7 @@ impl<'a> WebViewBuilder<'a> {
   /// - **OpenHarmony:** scripts are injected via ArkWeb `ScriptItem`s into every
   ///   frame matching the script rules (`"*"` plus the registered custom
   ///   schemes), and `for_main_frame_only` is ignored. Whether `file://` pages
-  ///   are covered by the `"*"` rule is unverified — do not assume injection
+  ///   are covered by the `"*"` rule is unverified -- do not assume injection
   ///   there until probed on a device.
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
@@ -1135,7 +1135,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - **OpenHarmony:** when combined with
   ///   [`WebViewBuilderExtOhos::with_https_scheme`], the intercept
-  ///   channel is synchronous-only — a responder that fires after this closure
+  ///   channel is synchronous-only -- a responder that fires after this closure
   ///   returns (the `std::thread::spawn` pattern in the example below) has its
   ///   result **discarded** and the request passes through (committer
   ///   Eulogizethesun/tauri#187). On OHOS, register asynchronous handlers via
@@ -1213,13 +1213,13 @@ impl<'a> WebViewBuilder<'a> {
   /// ## Platform-specific
   ///
   /// - **OpenHarmony:** three corrected semantics (committer
-  ///   Eulogizethesun/tauri#193): ① the `bool` return value of all four event
-  ///   handlers is ignored — but the default drop behavior is NOT unblockable:
+  ///   Eulogizethesun/tauri#193): (1) the `bool` return value of all four event
+  ///   handlers is ignored -- but the default drop behavior is NOT unblockable:
   ///   ArkWeb consumes OS file drops by navigating to `file://<dropped file>`,
   ///   and the ArkTS layer's `onLoadIntercept` constantly intercepts that
   ///   navigation and forwards it as the drag-drop event, so the default
-  ///   navigation is already prevented; ② `Enter` events always carry empty
-  ///   `paths` — only `Drop` carries the dropped paths; ③ re-enabling the
+  ///   navigation is already prevented; (2) `Enter` events always carry empty
+  ///   `paths` -- only `Drop` carries the dropped paths; (3) re-enabling the
   ///   default behavior via a `bool` return is not supported.
   pub fn with_drag_drop_handler<F>(mut self, handler: F) -> Self
   where
@@ -2024,7 +2024,7 @@ pub trait WebViewBuilderExtOhos {
   /// ## Platform-specific
   ///
   /// - **OpenHarmony:** the use_https intercept channel is synchronous-only
-  ///   (committer Eulogizethesun/tauri#187) — a handler that does not call
+  ///   (committer Eulogizethesun/tauri#187) -- a handler that does not call
   ///   `responder.respond(...)` before returning is treated as "no response":
   ///   its eventual result is discarded and the request passes through (wry
   ///   logs a warn and returns the passthrough response). Async handlers must
@@ -2307,7 +2307,7 @@ impl WebView {
   ///   store (persistent and session cookies) via
   ///   `WebCookieManager.clearAllCookiesSync(false)` before the browsing-data
   ///   cleanup (#191; availability-guarded, a missing/throwing API only warns).
-  ///   Not cleared: SSL cache and clientAuthCache — the SDK exposes no public
+  ///   Not cleared: SSL cache and clientAuthCache -- the SDK exposes no public
   ///   API for them.
   pub fn clear_all_browsing_data(&self) -> Result<()> {
     self.webview.clear_all_browsing_data()
@@ -2328,9 +2328,9 @@ impl WebView {
   ///   failed read silently falls back to the [`Rect`] default; on non-X11
   ///   backends the size comes from the GTK allocation while the position is
   ///   always (0, 0).
-  /// - **Android**: a stub — always the [`Rect`] default, regardless of the
+  /// - **Android**: a stub -- always the [`Rect`] default, regardless of the
   ///   actual layout.
-  /// - **OpenHarmony**: cache-only — the last bounds written at creation
+  /// - **OpenHarmony**: cache-only -- the last bounds written at creation
   ///   (builder bounds) or by [`WebView::set_bounds`]. It is NOT a live
   ///   geometry readback. The creation paths form a 2x2 matrix - webview
   ///   kind (MAIN or child) times bounds mode (the default or an explicit
@@ -2371,7 +2371,7 @@ impl WebView {
   /// - **OpenHarmony render semantics** (openspec ohos-webview-sizing): a
   ///   create request with explicit bounds renders the webview at the
   ///   requested size (not inflated to the container), and a runtime
-  ///   `set_bounds` applies position AND size — flipping a natural-layout
+  ///   `set_bounds` applies position AND size -- flipping a natural-layout
   ///   (bounds-less) webview away from container following. A bounds-less
   ///   webview keeps natural layout: it renders at "100%" and follows
   ///   window resizes through container layout.
@@ -2433,7 +2433,7 @@ pub enum DragDropEvent {
   Enter {
     /// List of paths that are being dragged onto the webview.
     ///
-    /// OpenHarmony: always empty — ArkWeb's drag-enter event carries no path
+    /// OpenHarmony: always empty -- ArkWeb's drag-enter event carries no path
     /// list; only [`DragDropEvent::Drop`] carries paths.
     paths: Vec<PathBuf>,
     /// Position of the drag operation, relative to the webview top-left corner.
@@ -2735,7 +2735,7 @@ pub trait WebViewExtOhos {
   /// Sends the remove op to the bridge and marks the webview disposed so the
   /// `Drop` implementation does not send a duplicate remove. On OpenHarmony
   /// the disposal is unified: it applies to child webviews (`new_as_child`)
-  /// AND to the main webview — the previous "no-op for non-child webviews"
+  /// AND to the main webview -- the previous "no-op for non-child webviews"
   /// gate leaked the main webview's ArkTS `Web` component on drop. The first
   /// of `dispose_child` / `Drop` performs the removal; every later call is a
   /// no-op (idempotent fence).
