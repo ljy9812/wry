@@ -832,8 +832,8 @@ fn set_bounds_with_cache(
     runtime,
     PendingOp::SetBounds(x, y, w, h),
   )?;
-  // ability-F6: the cache write skips sentinel components (the tauri
-  // -runtime-wry partial-bounds wire, issue Eulogizethesun/tauri#241), so
+  // ability-F6: the cache write skips sentinel components (the
+  // tauri-runtime-wry partial-bounds wire, issue Eulogizethesun/tauri#241), so
   // `bounds()` readers must never see -2147483648.0 as a real component.
   // Gate F3: with the pump thread dead the dispatch above is silently lost
   // (the disclosed bridge-dead surface for non-devtools ops) - skipping the
@@ -1208,8 +1208,8 @@ impl InnerWebView {
     //     rewrite used when `use_https` is enabled.
     //   * `"{scheme}://"` — matches custom-protocol origins (e.g. `tauri://`),
     //     which `"*"` does NOT match on ArkWeb: custom protocols require a
-    //     scheme-prefixed rule ending in `://` (see the openharmony-ability
-    //     multi-window design doc, `多窗口特性实现文档.md`, TODO-5). One rule
+    //     scheme-prefixed rule ending in `://` (see the tauri repo's
+    //     multi-window design doc under `tauri/doc/`, TODO-5). One rule
     //     per registered custom scheme.
     // The raw-scheme default (`tauri://localhost`) is the tauri default
     // (`useHttpsScheme` is false unless a consumer opts in), so the
@@ -1493,9 +1493,8 @@ impl InnerWebView {
     // render layer never applied (a MAIN webview with explicit `with_bounds`
     // is seeded with the explicit rect while the create-geometry style write
     // is gated on `is_child`), matching the creation matrix documented on
-    // `WebView::bounds`; the Gate F3
-    // "bounds() never reports unapplied set_bounds geometry" promise covers
-    // the set_bounds path only.
+    // `WebView::bounds`; the Gate F3 promise that `bounds()` never reports
+    // unapplied set_bounds geometry covers the set_bounds path only.
     let mut bounds_cache_seed = Rect::default();
     merge_bounds_into_cache(&mut bounds_cache_seed, initial_bounds);
 
@@ -1959,11 +1958,14 @@ impl InnerWebView {
   /// propagate to).
   ///
   /// Dangling-dispatch boundary: while create is still pending the
-  /// `Remove` op is queued and replayed once the handshake completes; if the
-  /// webview is never attached the queue is never replayed and the op is
-  /// bounded by the bridge's own 15s request timeout
-  /// (`ability::crates/ability/src/bridge/mod.rs` `DEFAULT_TIMEOUT_MS = 15_000`)
-  /// — no unbounded hang on either side.
+  /// `Remove` op is queued and replayed once the handshake completes. The two
+  /// arms are bounded differently: on the replay arm the queued op is
+  /// dispatched as a bridge request, so it is bounded by the bridge's own 15s
+  /// request timeout (`ability::crates/ability/src/bridge/mod.rs`
+  /// `DEFAULT_TIMEOUT_MS = 15_000`); on the never-attached arm the op is
+  /// never dispatched at all - no bridge request is issued and nothing waits
+  /// on one - so there is no pending call to time out and no hang to bound.
+  /// No unbounded hang on either side.
   pub fn dispose_child(&self) {
     if dispose_once(&self.disposed) {
       let _ = self.dispatch_or_queue(PendingOp::Remove);

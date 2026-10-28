@@ -2390,9 +2390,17 @@ impl WebView {
   /// OpenHarmony: the OHOS backend forwards the request to the ArkTS render
   /// layer, which applies position AND size for a full request and skips
   /// `i32::MIN` sentinel components on partial requests (tauri-runtime-wry's
-  /// SetSize/SetPosition updates, issue Eulogizethesun/tauri#241); a child
-  /// webview's first `set_bounds` flips the ArkTS node from natural layout to
-  /// explicit sizing. See the render semantics note on [`WebView::bounds`].
+  /// SetSize/SetPosition updates, issue Eulogizethesun/tauri#241); for a
+  /// child webview the first `set_bounds` is an explicit-to-explicit geometry
+  /// update - the create geometry was already written (for children even the
+  /// 200x200 default is written as real layout), so the node is never in
+  /// natural layout and there is nothing to flip. Flipping happens on the
+  /// MAIN path only: BOTH MAIN creation rows start in natural layout (the
+  /// create style write is gated `is_child && bounds.is_some()`, so a MAIN
+  /// create never carries geometry -- even MAIN with explicit `with_bounds`
+  /// applies nothing at create, its requested rect is cache-only), and the
+  /// first `set_bounds` on either row flips it. See the render semantics note
+  /// on [`WebView::bounds`].
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
     self.webview.set_bounds(bounds)
   }
