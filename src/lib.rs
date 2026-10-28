@@ -51,7 +51,7 @@
 //! event_loop.run_app(&mut app).unwrap();
 //! ```
 //!
-//! If you also want to support Wayland too, then we recommend you use [`WebViewBuilderExtUnix::new_gtk`] on Linux.
+//! If you also want to support Wayland too, then we recommend you use `WebViewBuilderExtUnix::new_gtk` on Linux.
 //! See the following example using [`tao`]:
 //!
 //! ```no_run
@@ -111,7 +111,7 @@
 //! ```
 //!
 //! If you want to support X11 and Wayland at the same time, we recommend using
-//! [`WebViewExtUnix::new_gtk`] or [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
+//! `WebViewExtUnix::new_gtk` or `WebViewBuilderExtUnix::new_gtk` with `gtk::Fixed`.
 //!
 //! ```no_run
 //! # use wry::{WebViewBuilder, raw_window_handle, Rect, dpi::*};
@@ -2332,29 +2332,34 @@ impl WebView {
   ///   actual layout.
   /// - **OpenHarmony**: cache-only — the last bounds written at creation
   ///   (builder bounds) or by [`WebView::set_bounds`]. It is NOT a live
-  ///   geometry readback. The creation paths differ in what the cache holds
-  ///   (the public builder starts from `WebViewAttributes::default()`,
-  ///   whose bounds default to logical origin + 200x200; the `None` arm is
-  ///   unreachable through the builder):
-  ///   - a MAIN webview created without explicit `with_bounds` keeps natural
-  ///     layout (no explicit create geometry) and the cache holds the 200x200
+  ///   geometry readback. The creation paths form a 2x2 matrix - webview
+  ///   kind (MAIN or child) times bounds mode (the default or an explicit
+  ///   `with_bounds`) - and the rows differ in what the cache holds (the
+  ///   public builder starts from `WebViewAttributes::default()`, whose
+  ///   bounds default to logical origin + 200x200; the `None` arm is
+  ///   unreachable through the builder, and the create-geometry style write
+  ///   is gated on `is_child && bounds.is_some()`):
+  ///   - MAIN, no explicit `with_bounds`: no create geometry is written, the
+  ///     webview keeps natural layout, and the cache holds the 200x200
   ///     default placeholder - NOT the actual on-screen geometry, which
   ///     follows the container;
-  ///   - a child webview via `build_as_child` without explicit `with_bounds`
-  ///     has that same 200x200 default written as EXPLICIT create geometry,
-  ///     so `bounds()` reads back the requested geometry, not a
-  ///     natural-layout placeholder;
-  ///   - a MAIN webview created WITH explicit `with_bounds` writes NO create
-  ///     geometry (the style write is gated on `is_child &&
-  ///     bounds.is_some()`), yet the cache holds the explicit rectangle -
-  ///     `bounds()` reports requested-but-never-applied geometry, the most
-  ///     misleading case of the four;
-  ///   - `set_bounds` writes the requested geometry, except that
-  ///     tauri-runtime-wry's `i32::MIN` sentinel components (partial
-  ///     updates) never enter the cache - a sentinel component keeps its
-  ///     previously cached value while the set components of the same
-  ///     request update theirs (per-component, matching the ArkTS render
-  ///     granularity).
+  ///   - MAIN, explicit `with_bounds`: no create geometry is written either,
+  ///     yet the cache holds the explicit rectangle - `bounds()` reports
+  ///     requested-but-never-applied geometry, the most misleading row;
+  ///   - child, no explicit `with_bounds`: the 200x200 default is itself
+  ///     written as the create geometry, so the cache matches the applied
+  ///     geometry - the default placeholder is real layout here;
+  ///   - child, explicit `with_bounds`: the explicit rectangle is written as
+  ///     the create geometry - the only creation row where the cache holds
+  ///     an explicitly requested rect that the render layer actually
+  ///     applied.
+  ///
+  ///   `set_bounds` is not a creation path: it writes the requested
+  ///   geometry, except that tauri-runtime-wry's `i32::MIN` sentinel
+  ///   components (partial updates) never enter the cache - a sentinel
+  ///   component keeps its previously cached value while the set components
+  ///   of the same request update theirs (per-component, matching the ArkTS
+  ///   render granularity).
   ///
   ///   In every case a cached component reflects only the last real write;
   ///   do not use this value to reconstruct or fill in unknown geometry
@@ -2377,7 +2382,7 @@ impl WebView {
   /// Set the webview bounds.
   ///
   /// This is only effective if the webview was created as a child
-  /// or created using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
+  /// or created using `WebViewBuilderExtUnix::new_gtk` with `gtk::Fixed`.
   ///
   /// OpenHarmony: the OHOS backend forwards the request to the ArkTS render
   /// layer, which applies position AND size for a full request and skips
