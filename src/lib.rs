@@ -2317,20 +2317,35 @@ impl WebView {
   ///
   /// What the value represents is platform-dependent:
   ///
-  /// - **Windows / macOS / iOS / Linux (GTK)**: the current geometry, read
-  ///   back live from the platform view (for child webviews; on Linux via
-  ///   the X11 window attributes or the GTK allocation).
+  /// - **Windows / macOS / iOS**: the current geometry, read back live from
+  ///   the platform view (for child webviews).
+  /// - **Linux (GTK)**: the read-back is partial - on X11 the position and
+  ///   size come from the X window attributes, but a failed read silently
+  ///   falls back to the [`Rect`] default; on non-X11 backends the size comes
+  ///   from the GTK allocation while the position is always (0, 0).
   /// - **Android**: a stub — always the [`Rect`] default, regardless of the
   ///   actual layout.
   /// - **OpenHarmony**: cache-only — the last bounds written at creation
   ///   (builder bounds) or by [`WebView::set_bounds`]. It is NOT a live
-  ///   geometry readback: for a webview created without explicit bounds
-  ///   (natural layout) the value is the [`WebViewAttributes::default()`]
-  ///   placeholder (logical origin, 200×200 size), not the actual
-  ///   on-screen geometry, which follows the container. Callers must not
-  ///   use this value to reconstruct or fill in unknown geometry
-  ///   components (tauri-runtime-wry's `i32::MIN` sentinels): a cached
-  ///   component reflects only what was last written.
+  ///   geometry readback. The creation paths differ in what the cache holds
+  ///   (the public builder starts from [`WebViewAttributes::default()`],
+  ///   whose bounds default to logical origin + 200x200; the `None` arm is
+  ///   unreachable through the builder):
+  ///   - a MAIN webview created without explicit `with_bounds` keeps natural
+  ///     layout (no explicit create geometry) and the cache holds the 200x200
+  ///     default placeholder - NOT the actual on-screen geometry, which
+  ///     follows the container;
+  ///   - a child webview via `build_as_child` without explicit `with_bounds`
+  ///     has that same 200x200 default written as EXPLICIT create geometry,
+  ///     so `bounds()` reads back the requested geometry, not a natural
+  ///     -layout placeholder;
+  ///   - `set_bounds` writes the requested geometry, except that
+  ///     tauri-runtime-wry's `i32::MIN` sentinel components (partial
+  ///     updates) never enter the cache - a sentinel-carrying axis keeps its
+  ///     previously cached value.
+  ///   In every case a cached component reflects only the last real write;
+  ///   do not use this value to reconstruct or fill in unknown geometry
+  ///   components.
   ///   The cache is refreshed on window resize only while the embedding
   ///   runtime re-issues `set_bounds` (tauri-runtime-wry's autoresize
   ///   flow); ArkUI-initiated layout changes (container relayout) are not
@@ -2351,9 +2366,12 @@ impl WebView {
   /// This is only effective if the webview was created as a child
   /// or created using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
   ///
-  /// OpenHarmony: the OHOS backend applies the full geometry (see the render
-  /// semantics note on [`WebView::bounds`]); a child webview's first
-  /// `set_bounds` flips the ArkTS node from natural layout to explicit sizing.
+  /// OpenHarmony: the OHOS backend forwards the request to the ArkTS render
+  /// layer, which applies position AND size for a full request and skips
+  /// `i32::MIN` sentinel components on partial requests (tauri-runtime-wry's
+  /// SetSize/SetPosition updates, issue Eulogizethesun/tauri#241); a child
+  /// webview's first `set_bounds` flips the ArkTS node from natural layout to
+  /// explicit sizing. See the render semantics note on [`WebView::bounds`].
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
     self.webview.set_bounds(bounds)
   }
