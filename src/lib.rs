@@ -2328,7 +2328,7 @@ impl WebView {
   /// - **OpenHarmony**: cache-only — the last bounds written at creation
   ///   (builder bounds) or by [`WebView::set_bounds`]. It is NOT a live
   ///   geometry readback. The creation paths differ in what the cache holds
-  ///   (the public builder starts from [`WebViewAttributes::default()`],
+  ///   (the public builder starts from `WebViewAttributes::default()`,
   ///   whose bounds default to logical origin + 200x200; the `None` arm is
   ///   unreachable through the builder):
   ///   - a MAIN webview created without explicit `with_bounds` keeps natural
