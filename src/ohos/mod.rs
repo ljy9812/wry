@@ -156,16 +156,21 @@ fn size_components(s: dpi::Size) -> (f64, f64) {
 ///
 /// Gate F5 (PR#26 review round 2): the merge is per COMPONENT, matching the
 /// ArkTS render layer's granularity (it skips sentinel components and
-/// applies only the set ones). This is DEFENSIVE hardening, not a live-input
-/// handler: no current production set_bounds caller sends a single-component
-/// sentinel - tauri-runtime-wry's OHOS wire carries whole-axis sentinel
+/// applies only the set ones). Whether a single-component sentinel can
+/// arrive splits by input surface. The internal producers -
+/// tauri-runtime-wry's own construction sites - send whole-axis sentinel
 /// pairs only (`SetSize` rides `ohos_unspecified_position()`, `SetPosition`
-/// rides `ohos_unspecified_size()`, issue Eulogizethesun/tauri#241), so a
-/// mixed partial such as `Position::Logical(i32::MIN, 100.0)` is unreachable
-/// through today's producers. The per-component behavior keeps the cache
-/// correct should the protocol grow per-axis updates or a direct-wry
-/// consumer hand-craft such a request; the F5 UT exists to pin this
-/// formula's correctness, not to describe a reachable production defect.
+/// rides `ohos_unspecified_size()`, issue Eulogizethesun/tauri#241); the
+/// whole-axis pair is the only shape they emit. But the public `set_bounds`
+/// surface - a direct-wry consumer, or an application author whose request
+/// passes through tauri core unchanged - can hand-craft a mixed partial such
+/// as `Position::Logical(i32::MIN, 100.0)` today. Such a request is
+/// REACHABLE input, not a hypothetical: per the wire contract (`i32::MIN` =
+/// this component unset) a deliberate hand-crafted mix is a legal request,
+/// so the per-component merge handles reachable input rather than being
+/// purely defensive. Future per-axis protocol growth is a further motive for
+/// the same behavior; the F5 UT exists to pin this formula's correctness for
+/// that input class, not to describe a production defect.
 /// Per-component updates stay within one dpi variant
 /// (a variant switch would mix units without a scale factor); a cross-variant
 /// axis is only replaced when ALL of its components are set, otherwise the
@@ -407,8 +412,10 @@ impl BridgeExecutor {
   /// - the `set_bounds` cache write, skipped on a dead pump so `bounds()`
   ///   never reports set_bounds geometry the render layer never applied
   ///   (the create-time seed write is the disclosed exception - it seeds
-  ///   requested geometry before any application exists; see the
-  ///   requested-not-applied creation rows on `WebView::bounds`).
+  ///   the cache with the builder bounds before any application exists;
+  ///   see the two MAIN creation rows on `WebView::bounds` whose cache
+  ///   does not reflect applied geometry - the default placeholder row
+  ///   and the requested-but-never-applied row).
   ///
   /// Every other op sent through here (eval, zoom, set_visible, focus,
   /// load_url, print, ...) stays silently lost on a dead pump - the
@@ -802,11 +809,12 @@ fn set_bounds_with_cache(
   // write keeps `bounds()` from reporting geometry the render layer never
   // applied. Scope carve-out (PR#26 review round 3): this promise covers the
   // set_bounds path only - the create-time seed write (Gate F4) is the
-  // disclosed exception, seeding requested geometry before any render-layer
-  // application exists, which is exactly the requested-not-applied creation
-  // rows documented on `WebView::bounds`. TOCTOU residual gap (disclosed): a
-  // thread dying right after this check still leaves the cache written but
-  // unapplied.
+  // disclosed exception: it seeds the cache with the builder bounds before
+  // any render-layer application exists, so on the two MAIN creation rows
+  // documented on `WebView::bounds` the cache does not reflect applied
+  // geometry (the default placeholder row and the requested-but-never-applied
+  // row). TOCTOU residual gap (disclosed): a thread dying right after this
+  // check still leaves the cache written but unapplied.
   if runtime.pump_thread_alive() {
     merge_bounds_into_cache(&mut bounds_cache.lock().unwrap(), bounds);
   } else {
@@ -1439,11 +1447,12 @@ impl InnerWebView {
     // future, so it has no pump-liveness precondition at all - unlike the
     // create drain, whose liveness check pins an invariant of pump-polled
     // execution and merely covers an execution-model change. Carve-out: this
-    // seed write is the disclosed 2x2 row where the cache holds
-    // requested-not-applied geometry (a MAIN webview with explicit
-    // `with_bounds` is seeded with the explicit rect while the
-    // create-geometry style write is gated on `is_child`), matching the
-    // creation matrix documented on `WebView::bounds`; the Gate F3
+    // seed write is the disclosed exception - it is what leaves the
+    // requested-but-never-applied creation row's cache holding a rect the
+    // render layer never applied (a MAIN webview with explicit `with_bounds`
+    // is seeded with the explicit rect while the create-geometry style write
+    // is gated on `is_child`), matching the creation matrix documented on
+    // `WebView::bounds`; the Gate F3
     // "bounds() never reports unapplied set_bounds geometry" promise covers
     // the set_bounds path only.
     let mut bounds_cache_seed = Rect::default();
@@ -1536,14 +1545,19 @@ impl InnerWebView {
   // recorded in the process-level flag first, and a pre-handshake open is
   // queued as `PendingOp::SetDevtools` for the create drain to replay.
   //
-  // W26-4: every failure path releases the process-level intent — a dead
-  // queue (`queue_pre_handshake_open`), a failed create
+  // W26-4: no *failure path* latches the idempotence gate for the rest of
+  // the process - every failure path releases the process-level intent: a
+  // dead queue (`queue_pre_handshake_open`), a failed create
   // (`failed_create_cleanup`), a failed replay (`PendingOp::SetDevtools`)
-  // and a failed ready-branch dispatch (`devtools_open_failed`) — so one
-  // failure can never latch the idempotence gate for the rest of the
-  // process. The per-webview `devtools_open` flag is NOT rolled back on an
-  // async enable failure: it records the requested intent (what
-  // `is_devtools_open` reports), and a later `close_devtools` clears it.
+  // and a failed ready-branch dispatch (`devtools_open_failed`). The
+  // disclosed pre-poll death window (see the new-window note above) is the
+  // remaining latch-forever timeline - a pump thread dying between the
+  // enqueue and the first poll of the create future runs neither match arm,
+  // no failure event fires there, so all four release points are skipped and
+  // a queued `SetDevtools` keeps the intent latched. The per-webview
+  // `devtools_open` flag is NOT rolled back on an async enable failure: it
+  // records the requested intent (what `is_devtools_open` reports), and a
+  // later `close_devtools` clears it.
   #[cfg(any(debug_assertions, feature = "devtools"))]
   pub fn open_devtools(&self) {
     let needs_dispatch = devtools_open_intent();
@@ -1572,7 +1586,12 @@ impl InnerWebView {
         // `open_devtools` early-returns on the fence and never re-enters the
         // dispatch path (the swap latch clears only via `close_devtools` or
         // a failure release), matching the documented DEVTOOLS_ENABLED
-        // limitation above.
+        // limitation above. This ready-branch residual gap is not the only
+        // latch-forever timeline: the disclosed pre-poll death window on the
+        // new-window create path (a pump thread dying between the enqueue
+        // and the first poll of the create future runs neither match arm, so
+        // all four W26-4 release points are skipped) ends the same way - see
+        // the new-window note above.
         if !self.runtime.pump_thread_alive() {
           devtools_open_failed(
             "open_devtools",
