@@ -2325,11 +2325,12 @@ impl WebView {
   /// - **OpenHarmony**: cache-only — the last bounds written at creation
   ///   (builder bounds) or by [`WebView::set_bounds`]. It is NOT a live
   ///   geometry readback: for a webview created without explicit bounds
-  ///   (natural layout) the value is the [`Rect`] default (logical origin,
-  ///   zero size), not the actual on-screen geometry, which follows the
-  ///   container. Callers must not use this value to reconstruct or fill in
-  ///   unknown geometry components (tauri-runtime-wry's `i32::MIN`
-  ///   sentinels): a cached component reflects only what was last written.
+  ///   (natural layout) the value is the [`WebViewAttributes::default()`]
+  ///   placeholder (logical origin, 200×200 size), not the actual
+  ///   on-screen geometry, which follows the container. Callers must not
+  ///   use this value to reconstruct or fill in unknown geometry
+  ///   components (tauri-runtime-wry's `i32::MIN` sentinels): a cached
+  ///   component reflects only what was last written.
   ///   The cache is refreshed on window resize only while the embedding
   ///   runtime re-issues `set_bounds` (tauri-runtime-wry's autoresize
   ///   flow); ArkUI-initiated layout changes (container relayout) are not

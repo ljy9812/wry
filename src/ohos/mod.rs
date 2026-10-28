@@ -1465,12 +1465,16 @@ impl InnerWebView {
   /// The value is therefore the last written bounds, never the live
   /// geometry.
   ///
-  /// For a natural-layout (bounds-less) webview the cache holds
-  /// `Rect::default()` (logical origin, zero size) — NOT the actual
-  /// on-screen geometry, which follows the container. Callers must not use
-  /// this value to reconstruct or fill in unknown geometry components
-  /// (tauri-runtime-wry's i32::MIN sentinels): a cached component reflects
-  /// only what was last written through the builder or `set_bounds`.
+  /// For a natural-layout (bounds-less) webview the cache holds the
+  /// `WebViewAttributes::default()` placeholder — logical position (0, 0),
+  /// size 200×200 — NOT the actual on-screen geometry, which follows the
+  /// container. (The `None` arm of the `unwrap_or_default` that seeds this
+  /// cache is unreachable through the public builder API: the attributes
+  /// default starts at `Some(200×200)` and `with_bounds` only ever writes
+  /// `Some`.) Callers must not use this value to reconstruct or fill in
+  /// unknown geometry components (tauri-runtime-wry's i32::MIN sentinels):
+  /// a cached component reflects only what was last written through the
+  /// builder or `set_bounds`.
   ///
   /// # Render semantics (openspec ohos-webview-sizing)
   ///
