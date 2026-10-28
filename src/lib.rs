@@ -2313,6 +2313,34 @@ impl WebView {
     self.webview.clear_all_browsing_data()
   }
 
+  /// Returns the webview bounds.
+  ///
+  /// What the value represents is platform-dependent:
+  ///
+  /// - **Windows / macOS / iOS / Linux (GTK)**: the current geometry, read
+  ///   back live from the platform view (for child webviews; on Linux via
+  ///   the X11 window attributes or the GTK allocation).
+  /// - **Android**: a stub — always the [`Rect`] default, regardless of the
+  ///   actual layout.
+  /// - **OpenHarmony**: cache-only — the last bounds written at creation
+  ///   (builder bounds) or by [`WebView::set_bounds`]. It is NOT a live
+  ///   geometry readback: for a webview created without explicit bounds
+  ///   (natural layout) the value is the [`Rect`] default (logical origin,
+  ///   zero size), not the actual on-screen geometry, which follows the
+  ///   container. Callers must not use this value to reconstruct or fill in
+  ///   unknown geometry components (tauri-runtime-wry's `i32::MIN`
+  ///   sentinels): a cached component reflects only what was last written.
+  ///   The cache is refreshed on window resize only while the embedding
+  ///   runtime re-issues `set_bounds` (tauri-runtime-wry's autoresize
+  ///   flow); ArkUI-initiated layout changes (container relayout) are not
+  ///   observed.
+  /// - **OpenHarmony render semantics** (openspec ohos-webview-sizing): a
+  ///   create request with explicit bounds renders the webview at the
+  ///   requested size (not inflated to the container), and a runtime
+  ///   `set_bounds` applies position AND size — flipping a natural-layout
+  ///   (bounds-less) webview away from container following. A bounds-less
+  ///   webview keeps natural layout: it renders at "100%" and follows
+  ///   window resizes through container layout.
   pub fn bounds(&self) -> Result<Rect> {
     self.webview.bounds()
   }
@@ -2323,7 +2351,7 @@ impl WebView {
   /// or created using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
   ///
   /// OpenHarmony: the OHOS backend applies the full geometry (see the render
-  /// semantics note on `WebView::bounds`); a child webview's first
+  /// semantics note on [`WebView::bounds`]); a child webview's first
   /// `set_bounds` flips the ArkTS node from natural layout to explicit sizing.
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
     self.webview.set_bounds(bounds)
@@ -2654,11 +2682,15 @@ pub trait WebViewExtOhos {
     config: Option<PdfConfig>,
     callback: Box<dyn Fn(bool) + Send + 'static>,
   ) -> Result<()>;
-  /// Disposes a webview that was created as a child (`new_as_child`).
+  /// Disposes the webview, removing its content from the window.
   ///
-  /// Sends the remove op to the bridge (no-op for non-child webviews) and
-  /// marks the webview disposed so the `Drop` implementation does not send a
-  /// duplicate remove.
+  /// Sends the remove op to the bridge and marks the webview disposed so the
+  /// `Drop` implementation does not send a duplicate remove. On OpenHarmony
+  /// the disposal is unified: it applies to child webviews (`new_as_child`)
+  /// AND to the main webview — the previous "no-op for non-child webviews"
+  /// gate leaked the main webview's ArkTS `Web` component on drop. The first
+  /// of `dispose_child` / `Drop` performs the removal; every later call is a
+  /// no-op (idempotent fence).
   fn dispose_child(&self);
 }
 

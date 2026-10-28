@@ -57,9 +57,12 @@ pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
 /// the ability binding `openharmony_ability::virtual_pixel_ratio` (which
 /// already falls back to 1.0 on a ≤0/absent binding); this second guard keeps
 /// the f32→f64 widening total so geometry conversion never divides by zero or
-/// NaN. Desktop baseline reports vp = 1.0 → division is an identity (319-case
-/// desktop suite and UT numbers stay bit-identical); a vp ≠ 1 device divides
-/// physical px by vp to land in ArkUI vp units.
+/// NaN. The live ratio is device-real: the OHOS desktop reference device
+/// reports vp = 1.9, so physical px is divided by vp before it reaches ArkUI
+/// vp units. Where the binding is absent (host builds and unit tests) the
+/// fallback is 1.0 — there the division is an identity and UT numbers stay
+/// bit-identical; that fallback value is NOT the ratio of any real OHOS
+/// device.
 pub(crate) fn vp_ratio_sanitized(vp: f64) -> f64 {
   if vp.is_finite() && vp > 0.0 {
     vp
@@ -361,7 +364,12 @@ impl PendingOp {
         // process-level DEVTOOLS_ENABLED flag was already set at the call
         // site, so this only needs the runtime channel.
         if let Err(e) = handle.set_web_debugging_access(true).await {
-          log::warn!("[wry] queued open_devtools replay failed: {}", e);
+          // W26-4: this queued op is consumed either way — it can never be
+          // retried — so a failed replay must release the intent. Leaving it
+          // latched would make the idempotence gate swallow every later
+          // open_devtools in this process (same policy as
+          // `failed_create_cleanup` for never-replayable queued opens).
+          devtools_open_failed("queued open_devtools replay", &e);
         }
       }
     }
@@ -374,6 +382,13 @@ impl PendingOp {
 /// channel is unreachable — and kept in sync on close. It is also the
 /// idempotence fence: an already-enabled flag means a prior open is queued
 /// (or applied), so repeat opens dispatch nothing new.
+///
+/// W26-4: because the flag doubles as the idempotence fence, every dead or
+/// failed open path releases it again — a dead queue
+/// ([`queue_pre_handshake_open`]), a failed create
+/// ([`failed_create_cleanup`]), a failed replay (`PendingOp::SetDevtools`)
+/// and a failed ready-branch dispatch ([`devtools_open_failed`]) — so a
+/// single failure can never block all later opens in the process.
 #[cfg(any(debug_assertions, feature = "devtools"))]
 static DEVTOOLS_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -390,6 +405,26 @@ fn devtools_open_intent() -> bool {
 #[cfg(any(debug_assertions, feature = "devtools"))]
 fn devtools_close_intent() -> bool {
   DEVTOOLS_ENABLED.swap(false, Ordering::SeqCst)
+}
+
+/// W26-4: shared failure handling for the two async enable paths — the
+/// ready-branch dispatch ([`InnerWebView::open_devtools`]) and the
+/// `PendingOp::SetDevtools` replay. A failed `set_web_debugging_access(true)`
+/// must release the process-level open intent: the flag is also the
+/// idempotence fence, so a latched `true` would permanently swallow every
+/// later `open_devtools` in this process. Same policy as
+/// [`failed_create_cleanup`] for a queued open that can never replay.
+/// Factored out so the host UT exercises the real failure path.
+///
+/// Race note (inherent to the async latch, identical to
+/// [`failed_create_cleanup`]): a concurrent `open_devtools` that consulted the
+/// still-latched flag before this release runs is not re-dispatched
+/// automatically — the next `open_devtools` call after the release does
+/// dispatch again.
+#[cfg(any(debug_assertions, feature = "devtools"))]
+fn devtools_open_failed(context: &str, e: &dyn std::fmt::Display) {
+  devtools_close_intent();
+  log::warn!("[wry] {context} failed, open intent released: {}", e);
 }
 
 // ─── Type aliases ─────────────────────────────────────────────────────────────────
@@ -986,8 +1021,9 @@ impl InnerWebView {
     // For child webviews with bounds, set initial style position/size.
     if is_child && bounds.is_some() {
       // #198: physical → ArkUI vp via the live display ratio (was a hardcoded
-      // 1.0 — a vp≠1 device now lands geometry in vp units; desktop vp=1.0 is
-      // an unchanged identity).
+      // 1.0 — a vp≠1 device now lands geometry in vp units; the
+      // absent-binding fallback 1.0 — host builds / UTs — is an unchanged
+      // identity, while the desktop reference device reports vp=1.9).
       let vp = virtual_pixel_ratio();
       let (x, y) = geometry_to_logical_vp(initial_bounds.position, vp);
       let (w, h) = size_to_logical_vp(initial_bounds.size, vp);
@@ -1164,6 +1200,15 @@ impl InnerWebView {
   // on the OHOS delayed-attach path the intent vanished. Now the intent is
   // recorded in the process-level flag first, and a pre-handshake open is
   // queued as `PendingOp::SetDevtools` for the create drain to replay.
+  //
+  // W26-4: every failure path releases the process-level intent — a dead
+  // queue (`queue_pre_handshake_open`), a failed create
+  // (`failed_create_cleanup`), a failed replay (`PendingOp::SetDevtools`)
+  // and a failed ready-branch dispatch (`devtools_open_failed`) — so one
+  // failure can never latch the idempotence gate for the rest of the
+  // process. The per-webview `devtools_open` flag is NOT rolled back on an
+  // async enable failure: it records the requested intent (what
+  // `is_devtools_open` reports), and a later `close_devtools` clears it.
   #[cfg(any(debug_assertions, feature = "devtools"))]
   pub fn open_devtools(&self) {
     let needs_dispatch = devtools_open_intent();
@@ -1176,7 +1221,9 @@ impl InnerWebView {
       Some(handle) => {
         self.runtime.spawn(async move {
           if let Err(e) = handle.set_web_debugging_access(true).await {
-            log::warn!("[wry] open_devtools failed: {}", e);
+            // W26-4: a failed enable must not latch the idempotence gate —
+            // release the intent so a later open dispatches again.
+            devtools_open_failed("open_devtools", &e);
           }
         });
       }
@@ -1393,21 +1440,37 @@ impl InnerWebView {
   ///
   /// [`Self::set_bounds`] converts window physical coordinates into ArkUI vp
   /// units through the live display virtual-pixel ratio
-  /// ([`virtual_pixel_ratio`], #198 — previously a hardcoded 1.0). The
-  /// desktop baseline reports vp = 1.0, so existing values are handed to
-  /// ArkUI **vp** unchanged (the historical full-stack "physical px == vp"
-  /// assumption); on vp ≠ 1 devices physical px is divided by vp first.
-  /// Logical-coordinate input passes through `dpi::Position::to_logical`
-  /// unchanged regardless of vp.
+  /// ([`virtual_pixel_ratio`], #198 — previously a hardcoded 1.0). The live
+  /// ratio is device-real: the OHOS desktop reference device reports
+  /// vp = 1.9, so physical px is divided by vp before it reaches ArkUI (the
+  /// historical full-stack "physical px == vp" assumption held only where
+  /// the binding is absent and the fallback 1.0 applies — host builds and
+  /// unit tests, where the conversion is an identity and UT numbers stay
+  /// bit-identical). Logical-coordinate input passes through
+  /// `dpi::Position::to_logical` unchanged regardless of vp.
   ///
-  /// # Cache semantics
+  /// # Cache semantics (not a live geometry readback)
   ///
   /// The value is cache-only: written at creation (builder bounds) and on
-  /// every `set_bounds`. Window resizes keep it fresh through the runtime's
-  /// autoresize path (tauri-runtime-wry re-issues `set_bounds` on window
-  /// resize, which writes this cache). ArkUI-initiated layout changes are not
-  /// observed — no bridge writeback exists — because they do not occur under
-  /// the tauri app model, where only the runtime moves webviews.
+  /// every `set_bounds`. `wry` itself never refreshes it on window resizes —
+  /// freshness depends entirely on the embedding runtime re-issuing
+  /// `set_bounds`, which tauri-runtime-wry does on window resize only
+  /// through its autoresize flow (that re-issued call writes this cache).
+  /// Without that flow the cache goes stale as the window resizes.
+  ///
+  /// ArkUI-initiated layout changes DO occur and are NOT observed (no bridge
+  /// writeback exists): a natural-layout webview follows container layout —
+  /// window resizes move and resize its ArkTS node with no `set_bounds`
+  /// call — so the cache can go stale without any write from the runtime.
+  /// The value is therefore the last written bounds, never the live
+  /// geometry.
+  ///
+  /// For a natural-layout (bounds-less) webview the cache holds
+  /// `Rect::default()` (logical origin, zero size) — NOT the actual
+  /// on-screen geometry, which follows the container. Callers must not use
+  /// this value to reconstruct or fill in unknown geometry components
+  /// (tauri-runtime-wry's i32::MIN sentinels): a cached component reflects
+  /// only what was last written through the builder or `set_bounds`.
   ///
   /// # Render semantics (openspec ohos-webview-sizing)
   ///
@@ -1423,7 +1486,8 @@ impl InnerWebView {
 
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
     // #198: physical → ArkUI vp via the live display ratio (was a hardcoded
-    // 1.0; desktop vp=1.0 keeps the previous values bit-identical).
+    // 1.0; the absent-binding fallback 1.0 keeps host/UT values
+    // bit-identical — the desktop reference device reports vp=1.9).
     let vp = virtual_pixel_ratio();
     let (x, y) = geometry_to_logical_vp(bounds.position, vp);
     let (w, h) = size_to_logical_vp(bounds.size, vp);
@@ -1563,7 +1627,11 @@ pub fn platform_webview_version() -> Result<String> {
 /// back to GET; a single malformed header (name/value not a legal HTTP token)
 /// is skipped with a debug log rather than failing the whole request. The
 /// request body is NOT forwarded: the OHOS platform exposes no accessor for
-/// it (disclosed in ohos-platform-limitations).
+/// it (disclosed in ohos-platform-limitations). W26-5: the body-framing
+/// headers `content-length` and `transfer-encoding` are dropped from the
+/// forwarded set (case-insensitively) — the rebuilt request's body is always
+/// empty, so forwarding a stale framing header would make a downstream
+/// consumer wait for body bytes (or a chunked terminator) that never arrive.
 fn dispatch_https_intercept_sync(
   url: &str,
   webview_id: &str,
@@ -1625,14 +1693,28 @@ fn dispatch_https_intercept_sync(
   }
   if let (Some(names), Some(values)) = (header_names, header_values) {
     for (name, value) in names.iter().zip(values.iter()) {
-      let name_ok = http::HeaderName::from_bytes(name.as_bytes()).is_ok();
+      let parsed_name = http::HeaderName::from_bytes(name.as_bytes());
       let value_ok = http::HeaderValue::from_str(value).is_ok();
-      if !name_ok || !value_ok {
+      if parsed_name.is_err() || !value_ok {
         // One bad header must not sink the request — skip it.
         log::debug!("[wry https-intercept] skipping invalid header '{name}': '{value}'");
         continue;
       }
-      builder = builder.header(name.as_str(), value);
+      // W26-5: the body is never forwarded (always empty), so body-framing
+      // headers must not be forwarded either — a stale `content-length` /
+      // `transfer-encoding` would make a downstream consumer wait for body
+      // bytes that never arrive. Dropped case-insensitively via the parsed
+      // (lowercased) name.
+      let header_name = parsed_name.unwrap();
+      if header_name == http::header::CONTENT_LENGTH
+        || header_name == http::header::TRANSFER_ENCODING
+      {
+        log::debug!(
+          "[wry https-intercept] dropping body-framing header '{name}' (body is not forwarded)"
+        );
+        continue;
+      }
+      builder = builder.header(header_name, value);
     }
   }
   let request = match builder.body(Vec::new()) {
@@ -2725,6 +2807,40 @@ mod tests {
     DEVTOOLS_ENABLED.store(saved, Ordering::SeqCst);
   }
 
+  /// W26-4: a failed async enable — the ready-branch dispatch or the
+  /// `PendingOp::SetDevtools` replay — releases the process-level open intent
+  /// through the REAL shared failure handler, so one failure can never latch
+  /// the idempotence gate and swallow every later open_devtools in the
+  /// process.
+  /// # Brief: 1) flip the intent 2) run the real `devtools_open_failed` 3)
+  /// assert the intent is released and a later open dispatches again.
+  #[cfg(any(debug_assertions, feature = "devtools"))]
+  #[test]
+  fn ut_devtools_open_failed_releases_intent_for_later_opens() {
+    let _guard = devtools_ut_lock();
+    let saved = DEVTOOLS_ENABLED.load(Ordering::SeqCst);
+    DEVTOOLS_ENABLED.store(false, Ordering::SeqCst);
+
+    assert!(
+      devtools_open_intent(),
+      "the open must flip the intent first"
+    );
+    devtools_open_failed(
+      "open_devtools",
+      &crate::Error::OpenHarmonyInitError("injected enable failure".into()),
+    );
+    assert!(
+      !DEVTOOLS_ENABLED.load(Ordering::SeqCst),
+      "the failed enable must release the process-level open intent"
+    );
+    assert!(
+      devtools_open_intent(),
+      "after the release a later open must dispatch again (no permanent latch)"
+    );
+
+    DEVTOOLS_ENABLED.store(saved, Ordering::SeqCst);
+  }
+
   // #189 (design D3): the unified dispose fence.
 
   /// UT for #189: the fence fires exactly once — a fresh webview owes the
@@ -2807,6 +2923,47 @@ mod tests {
     assert!(
       lines.contains(&"header:accept=application/json".to_string()),
       "header 2 missing: {lines:?}"
+    );
+  }
+
+  /// UT for W26-5: body-framing headers (`content-length` /
+  /// `transfer-encoding`) are dropped from the forwarded set — the rebuilt
+  /// request's body is always empty, so forwarding a stale framing header
+  /// would make a downstream consumer wait for body bytes that never arrive.
+  /// Dropped case-insensitively; unrelated headers pass through untouched.
+  /// # Brief: 1) dispatch with mixed-case framing headers + one regular
+  /// header 2) assert both framing headers are gone and the regular header
+  /// survives.
+  #[test]
+  fn ut_intercept_body_framing_headers_are_dropped() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let resp = dispatch_https_intercept_sync(
+      "https://myproto.localhost/data",
+      "w1",
+      &https_capture_handler("myproto", Arc::clone(&captured)),
+      Some("POST"),
+      Some(&[
+        "Content-Length".to_string(),
+        "transfer-encoding".to_string(),
+        "x-keep".to_string(),
+      ]),
+      Some(&["10".to_string(), "chunked".to_string(), "1".to_string()]),
+    );
+    assert!(resp.handled);
+    let lines = captured_lines(&captured);
+    assert!(
+      !lines.iter().any(|l| l.starts_with("header:content-length")),
+      "stale content-length must not reach the handler: {lines:?}"
+    );
+    assert!(
+      !lines
+        .iter()
+        .any(|l| l.starts_with("header:transfer-encoding")),
+      "stale transfer-encoding must not reach the handler: {lines:?}"
+    );
+    assert!(
+      lines.contains(&"header:x-keep=1".to_string()),
+      "unrelated headers must pass through: {lines:?}"
     );
   }
 
