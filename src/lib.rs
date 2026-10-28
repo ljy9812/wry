@@ -2320,9 +2320,14 @@ impl WebView {
   /// - **Windows / macOS / iOS**: the current geometry, read back live from
   ///   the platform view (for child webviews).
   /// - **Linux (GTK)**: the read-back is partial - on X11 the position and
-  ///   size come from the X window attributes, but a failed read silently
-  ///   falls back to the [`Rect`] default; on non-X11 backends the size comes
-  ///   from the GTK allocation while the position is always (0, 0).
+  ///   size come from the X window attributes of the webview's own X window
+  ///   (for child webviews); a MAIN webview embeds directly into the parent
+  ///   window and its read-back targets the parent's X window
+  ///   (src/webkitgtk/mod.rs `new_x11`), so `bounds()` returns the parent
+  ///   window's screen geometry rather than the webview's own geometry. A
+  ///   failed read silently falls back to the [`Rect`] default; on non-X11
+  ///   backends the size comes from the GTK allocation while the position is
+  ///   always (0, 0).
   /// - **Android**: a stub — always the [`Rect`] default, regardless of the
   ///   actual layout.
   /// - **OpenHarmony**: cache-only — the last bounds written at creation
@@ -2337,12 +2342,19 @@ impl WebView {
   ///     follows the container;
   ///   - a child webview via `build_as_child` without explicit `with_bounds`
   ///     has that same 200x200 default written as EXPLICIT create geometry,
-  ///     so `bounds()` reads back the requested geometry, not a natural
-  ///     -layout placeholder;
+  ///     so `bounds()` reads back the requested geometry, not a
+  ///     natural-layout placeholder;
+  ///   - a MAIN webview created WITH explicit `with_bounds` writes NO create
+  ///     geometry (the style write is gated on `is_child &&
+  ///     bounds.is_some()`), yet the cache holds the explicit rectangle -
+  ///     `bounds()` reports requested-but-never-applied geometry, the most
+  ///     misleading case of the four;
   ///   - `set_bounds` writes the requested geometry, except that
   ///     tauri-runtime-wry's `i32::MIN` sentinel components (partial
-  ///     updates) never enter the cache - a sentinel-carrying axis keeps its
-  ///     previously cached value.
+  ///     updates) never enter the cache - a sentinel component keeps its
+  ///     previously cached value while the set components of the same
+  ///     request update theirs (per-component, matching the ArkTS render
+  ///     granularity).
   ///
   ///   In every case a cached component reflects only the last real write;
   ///   do not use this value to reconstruct or fill in unknown geometry
