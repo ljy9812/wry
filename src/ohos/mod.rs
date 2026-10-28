@@ -181,8 +181,11 @@ fn size_components(s: dpi::Size) -> (f64, f64) {
 /// the width/height rates and the `SetPosition` arm only the x/y rates (the
 /// sentinel component is not written). A hand-mixed sentinel therefore puts
 /// `i32::MIN`-derived garbage values into that rate cache (only for a
-/// webview holding a rate cache: explicit-bounds create, or autoresize
-/// already armed), and the next `TaoWindowEvent::Resized` fires the
+/// webview holding a rate cache: on OHOS that is one created with explicit
+/// bounds AND auto_resize armed at create; runtime arming never creates a
+/// holder there, the `SetAutoResize` enable leg is a no-op on OHOS - only
+/// desktop's enable leg re-derives rates from the live bounds), and the
+/// next `TaoWindowEvent::Resized` fires the
 /// auto-resize re-apply leg, which multiplies the garbage rates by the new
 /// window size into a full real `Rect` and re-sends it - applied as usual.
 /// The consequence is bounded and recoverable (any later real `set_bounds`
