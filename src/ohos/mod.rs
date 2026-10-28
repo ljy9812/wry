@@ -156,10 +156,17 @@ fn size_components(s: dpi::Size) -> (f64, f64) {
 ///
 /// Gate F5 (PR#26 review round 2): the merge is per COMPONENT, matching the
 /// ArkTS render layer's granularity (it skips sentinel components and
-/// applies only the set ones). A mixed partial such as
-/// `Position::Logical(i32::MIN, 100.0)` therefore keeps the cached x and
-/// updates y - the previous whole-axis merge discarded the real y that the
-/// render layer DID apply. Per-component updates stay within one dpi variant
+/// applies only the set ones). This is DEFENSIVE hardening, not a live-input
+/// handler: no current production set_bounds caller sends a single-component
+/// sentinel - tauri-runtime-wry's OHOS wire carries whole-axis sentinel
+/// pairs only (`SetSize` rides `ohos_unspecified_position()`, `SetPosition`
+/// rides `ohos_unspecified_size()`, issue Eulogizethesun/tauri#241), so a
+/// mixed partial such as `Position::Logical(i32::MIN, 100.0)` is unreachable
+/// through today's producers. The per-component behavior keeps the cache
+/// correct should the protocol grow per-axis updates or a direct-wry
+/// consumer hand-craft such a request; the F5 UT exists to pin this
+/// formula's correctness, not to describe a reachable production defect.
+/// Per-component updates stay within one dpi variant
 /// (a variant switch would mix units without a scale factor); a cross-variant
 /// axis is only replaced when ALL of its components are set, otherwise the
 /// cached axis is kept wholesale (conservative, the pre-F5 whole-axis
@@ -389,18 +396,24 @@ impl BridgeExecutor {
   ///
   /// Gate F5: this cannot report an enqueue failure: tokio 1.x
   /// `Handle::spawn` never fails the enqueue (a task bound onto a dead
-  /// runtime is simply never polled, and no error surfaces). The ONLY effect
-  /// guarded against that silent loss is the devtools open intent - the
-  /// process's one execution point that must not be lost: its dispatch sites
-  /// consult [`BridgeExecutor::pump_thread_alive`] (the ready-branch open
-  /// right after spawning, the pre-handshake queue arm before enqueueing)
-  /// and release the intent on a dead pump, and the create drain releases it
-  /// when its replay could never be polled. The `set_bounds` cache write is
-  /// likewise skipped on a dead pump so `bounds()` never reports geometry
-  /// the render layer never applied. Every other op sent through here (eval,
-  /// zoom, set_visible, focus, load_url, print, ...) stays silently lost on
-  /// a dead pump - the disclosed bridge-dead surface, deliberately left as
-  /// is (PR#26 review round 2, F3).
+  /// runtime is simply never polled, and no error surfaces). The two effects
+  /// guarded against that silent loss are:
+  /// - the devtools open intent - the process's one execution point that
+  ///   must not be lost: its dispatch sites consult
+  ///   [`BridgeExecutor::pump_thread_alive`] (the ready-branch open right
+  ///   after spawning, the pre-handshake queue arm before enqueueing) and
+  ///   release the intent on a dead pump, and the create drain releases it
+  ///   when its replay could never be polled;
+  /// - the `set_bounds` cache write, skipped on a dead pump so `bounds()`
+  ///   never reports set_bounds geometry the render layer never applied
+  ///   (the create-time seed write is the disclosed exception - it seeds
+  ///   requested geometry before any application exists; see the
+  ///   requested-not-applied creation rows on `WebView::bounds`).
+  ///
+  /// Every other op sent through here (eval, zoom, set_visible, focus,
+  /// load_url, print, ...) stays silently lost on a dead pump - the
+  /// disclosed bridge-dead surface, deliberately left as is (PR#26 review
+  /// round 2, F3).
   pub(crate) fn spawn<F>(&self, future: F)
   where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -787,8 +800,13 @@ fn set_bounds_with_cache(
   // Gate F3: with the pump thread dead the dispatch above is silently lost
   // (the disclosed bridge-dead surface for non-devtools ops) - skipping the
   // write keeps `bounds()` from reporting geometry the render layer never
-  // applied. TOCTOU residual gap (disclosed): a thread dying right after
-  // this check still leaves the cache written but unapplied.
+  // applied. Scope carve-out (PR#26 review round 3): this promise covers the
+  // set_bounds path only - the create-time seed write (Gate F4) is the
+  // disclosed exception, seeding requested geometry before any render-layer
+  // application exists, which is exactly the requested-not-applied creation
+  // rows documented on `WebView::bounds`. TOCTOU residual gap (disclosed): a
+  // thread dying right after this check still leaves the cache written but
+  // unapplied.
   if runtime.pump_thread_alive() {
     merge_bounds_into_cache(&mut bounds_cache.lock().unwrap(), bounds);
   } else {
@@ -1329,6 +1347,16 @@ impl InnerWebView {
           // execution-model change. A thread dying right after this check
           // is the disclosed TOCTOU residual gap - the release below could
           // no longer run either.)
+          //
+          // Wider disclosed window (PR#26 review round 3): a pump thread
+          // dying BEFORE this create future is ever polled runs neither arm
+          // of this match - no drain, no `failed_create_cleanup`, no
+          // rollback - so a queued `SetDevtools` keeps the process-level
+          // open intent latched forever and queued ops (plus this attempt's
+          // registry entries) are never cleaned up. That window is strictly
+          // wider than the drain-point TOCTOU above and stays disclosed
+          // rather than guarded: it requires the pump to die between the
+          // enqueue and the first poll of this future.
           #[cfg(any(debug_assertions, feature = "devtools"))]
           if !runtime_for_create.pump_thread_alive()
             && pending
@@ -1405,6 +1433,19 @@ impl InnerWebView {
     // that default. The create-request style write above keeps using the
     // unfiltered `initial_bounds` - the wire carries the raw request and the
     // ArkTS render layer does its own sentinel skipping.
+    //
+    // Execution model (PR#26 review round 3): this seed merge runs
+    // synchronously in the builder body, NOT as part of the spawned create
+    // future, so it has no pump-liveness precondition at all - unlike the
+    // create drain, whose liveness check pins an invariant of pump-polled
+    // execution and merely covers an execution-model change. Carve-out: this
+    // seed write is the disclosed fourth path where the cache holds
+    // requested-not-applied geometry (e.g. a MAIN webview with explicit
+    // `with_bounds` is seeded with the explicit rect while the
+    // create-geometry style write is gated on `is_child`), matching the
+    // creation rows documented on `WebView::bounds`; the Gate F3
+    // "bounds() never reports unapplied set_bounds geometry" promise covers
+    // the set_bounds path only.
     let mut bounds_cache_seed = Rect::default();
     merge_bounds_into_cache(&mut bounds_cache_seed, initial_bounds);
 
