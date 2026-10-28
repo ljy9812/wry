@@ -81,11 +81,41 @@ pub(crate) fn virtual_pixel_ratio() -> f64 {
 /// `vp`; a `Logical` input is an identity). A named fn keeps the
 /// vp=1-identity / vp=2-halving contract unit-testable without a live
 /// display binding.
+///
+/// Gate F6 (PR#26 review round 2): a `Physical` component carrying the
+/// [`I32_MIN_SENTINEL`] is screened BEFORE the division. The ArkTS render
+/// layer receives logical values and identifies unset components by exact
+/// equality with the sentinel; a blind `x / vp` would destroy that exact
+/// value (i32::MIN / 1.9 != i32::MIN) and the sentinel would be applied as a
+/// real position. A sentinel component therefore maps 1:1 onto the sentinel
+/// logical value - the cache merge ([`merge_bounds_into_cache`]) and the
+/// ArkTS side then judge the identical value. `Logical` inputs need no
+/// screening: `to_logical` is an identity there, so a sentinel component
+/// already reaches the render layer untouched.
 pub(crate) fn geometry_to_logical_vp(value: dpi::Position, vp: f64) -> (f64, f64) {
-  value.to_logical::<f64>(vp).into()
+  let (raw_x, raw_y) = position_components(value);
+  let (x, y): (f64, f64) = value.to_logical::<f64>(vp).into();
+  (
+    if raw_x == I32_MIN_SENTINEL {
+      I32_MIN_SENTINEL
+    } else {
+      x
+    },
+    if raw_y == I32_MIN_SENTINEL {
+      I32_MIN_SENTINEL
+    } else {
+      y
+    },
+  )
 }
 
 /// Same conversion for geometry sizes ([`dpi::Size`]).
+///
+/// No sentinel arm here (Gate F6 doc note): the sentinel is `i32::MIN`
+/// widened to f64, and a `PhysicalSize` component is a `u32` widened to f64,
+/// so it can never equal the negative sentinel - the vp division cannot
+/// destroy one. A `LogicalSize` sentinel pair passes through `to_logical`
+/// unchanged.
 pub(crate) fn size_to_logical_vp(value: dpi::Size, vp: f64) -> (f64, f64) {
   value.to_logical::<f64>(vp).into()
 }
@@ -119,31 +149,84 @@ fn size_components(s: dpi::Size) -> (f64, f64) {
 }
 
 /// ability-F6: the cache write of [`InnerWebView::set_bounds`]. A request
-/// carrying the [`I32_MIN_SENTINEL`] in any component of an axis is a partial
-/// update for that axis ("this component is not set"); writing it into the
-/// public bounds cache would hand `bounds()` readers -2147483648.0 as a real
-/// position/size. Sentinel-carrying axes therefore keep the cached value
-/// wholesale (the cache's variant and units stay self-consistent); axes with
-/// only real components are replaced, which is the pre-F6 behavior. The
-/// wire's partial requests are whole-axis sentinel pairs
-/// (`ohos_unspecified_position` / `ohos_unspecified_size`), so axis
-/// granularity covers the real contract; a hypothetical mixed-variant
-/// per-component partial keeps the cached axis too (conservative: there is
-/// no sentinel-free interpretation without a scale factor).
+/// carrying the [`I32_MIN_SENTINEL`] in a component is a partial update for
+/// that component ("this component is not set"); writing it into the public
+/// bounds cache would hand `bounds()` readers -2147483648.0 as a real
+/// position/size.
+///
+/// Gate F5 (PR#26 review round 2): the merge is per COMPONENT, matching the
+/// ArkTS render layer's granularity (it skips sentinel components and
+/// applies only the set ones). A mixed partial such as
+/// `Position::Logical(i32::MIN, 100.0)` therefore keeps the cached x and
+/// updates y - the previous whole-axis merge discarded the real y that the
+/// render layer DID apply. Per-component updates stay within one dpi variant
+/// (a variant switch would mix units without a scale factor); a cross-variant
+/// axis is only replaced when ALL of its components are set, otherwise the
+/// cached axis is kept wholesale (conservative, the pre-F5 whole-axis
+/// behavior).
 ///
 /// The dispatched `PendingOp::SetBounds` is unaffected either way: the wire
 /// carries the raw request and the ArkTS render layer does its own sentinel
 /// skipping; this merge only governs the read-back bookkeeping.
 fn merge_bounds_into_cache(cache: &mut Rect, incoming: Rect) {
   let (ix, iy) = position_components(incoming.position);
-  let (iw, ih) = size_components(incoming.size);
-  let position_is_set = ix != I32_MIN_SENTINEL && iy != I32_MIN_SENTINEL;
-  let size_is_set = iw != I32_MIN_SENTINEL && ih != I32_MIN_SENTINEL;
-  if position_is_set {
-    cache.position = incoming.position;
+  let x_set = ix != I32_MIN_SENTINEL;
+  let y_set = iy != I32_MIN_SENTINEL;
+  match (&mut cache.position, incoming.position) {
+    // Same-variant: true per-component merge - the units are comparable.
+    (dpi::Position::Logical(c), dpi::Position::Logical(i)) => {
+      if x_set {
+        c.x = i.x;
+      }
+      if y_set {
+        c.y = i.y;
+      }
+    }
+    // Physical positions are i32 pairs, so the (negative) sentinel CAN ride
+    // here; the screening above governs each component independently.
+    (dpi::Position::Physical(c), dpi::Position::Physical(i)) => {
+      if x_set {
+        c.x = i.x;
+      }
+      if y_set {
+        c.y = i.y;
+      }
+    }
+    // Cross-variant: only a full-axis replace is unit-safe; a cross-variant
+    // mixed partial keeps the cached axis wholesale.
+    (cached, incoming) => {
+      if x_set && y_set {
+        *cached = incoming;
+      }
+    }
   }
-  if size_is_set {
-    cache.size = incoming.size;
+  let (iw, ih) = size_components(incoming.size);
+  let w_set = iw != I32_MIN_SENTINEL;
+  let h_set = ih != I32_MIN_SENTINEL;
+  match (&mut cache.size, incoming.size) {
+    (dpi::Size::Logical(c), dpi::Size::Logical(i)) => {
+      if w_set {
+        c.width = i.width;
+      }
+      if h_set {
+        c.height = i.height;
+      }
+    }
+    // A PhysicalSize component is u32 widened to f64 and can never equal the
+    // negative sentinel, so this arm is always a full replace.
+    (dpi::Size::Physical(c), dpi::Size::Physical(i)) => {
+      if w_set {
+        c.width = i.width;
+      }
+      if h_set {
+        c.height = i.height;
+      }
+    }
+    (cached, incoming) => {
+      if w_set && h_set {
+        *cached = incoming;
+      }
+    }
   }
 }
 
@@ -306,9 +389,18 @@ impl BridgeExecutor {
   ///
   /// Gate F5: this cannot report an enqueue failure: tokio 1.x
   /// `Handle::spawn` never fails the enqueue (a task bound onto a dead
-  /// runtime is simply never polled, and no error surfaces). Spawn sites
-  /// whose effect must not be silently lost on a dead runtime check
-  /// [`BridgeExecutor::pump_thread_alive`] right after spawning.
+  /// runtime is simply never polled, and no error surfaces). The ONLY effect
+  /// guarded against that silent loss is the devtools open intent - the
+  /// process's one execution point that must not be lost: its dispatch sites
+  /// consult [`BridgeExecutor::pump_thread_alive`] (the ready-branch open
+  /// right after spawning, the pre-handshake queue arm before enqueueing)
+  /// and release the intent on a dead pump, and the create drain releases it
+  /// when its replay could never be polled. The `set_bounds` cache write is
+  /// likewise skipped on a dead pump so `bounds()` never reports geometry
+  /// the render layer never applied. Every other op sent through here (eval,
+  /// zoom, set_visible, focus, load_url, print, ...) stays silently lost on
+  /// a dead pump - the disclosed bridge-dead surface, deliberately left as
+  /// is (PR#26 review round 2, F3).
   pub(crate) fn spawn<F>(&self, future: F)
   where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -545,6 +637,11 @@ pub(crate) struct InnerWebView {
   page_loaded: Arc<AtomicBool>,
   url_cache: Arc<Mutex<String>>,
   bounds_cache: Mutex<Rect>,
+  /// Per-webview "devtools requested" flag - written by `open_devtools` /
+  /// `close_devtools`, read by `is_devtools_open`. Every one of those is
+  /// devtools-gated, so the field is too (Gate F11: otherwise it is a
+  /// dead_code warning in a release build without the devtools feature).
+  #[cfg(any(debug_assertions, feature = "devtools"))]
   devtools_open: AtomicBool,
   /// #188: the creation-time incognito flag (`WebViewAttributes.incognito`).
   /// The main-thread `cookies_for_url` sync bridge is id-less, so the store
@@ -612,6 +709,15 @@ fn queue_pre_handshake_open(
 /// The parameters are exactly the `InnerWebView` fields the method touches —
 /// no test-only seam. **TOCTOU guard** (unchanged): the `pending_ops` lock must
 /// be held when checking `handle.get()` and when pushing the queued op.
+///
+/// Gate F2 (PR#26 review round 2): the queue arm refuses an op when the
+/// bridge runtime's pump thread is already dead — a queued op replays only
+/// through the create drain, which is itself polled by that very thread — so
+/// the op surfaces an Err synchronously instead of sitting in a queue that
+/// never drains. For the devtools open this Err is what makes
+/// [`queue_pre_handshake_open`] release the process-level intent (making the
+/// synchronous-Err claim true on the queue arm too); for every other op it
+/// turns a silent never-replayed queue entry into a surfaced error.
 fn dispatch_or_queue_op(
   pending_ops: &std::sync::Mutex<Vec<PendingOp>>,
   handle: &OnceLock<WebviewHandle>,
@@ -633,11 +739,64 @@ fn dispatch_or_queue_op(
       "webview creation failed: {}",
       err
     )))
+  } else if !runtime.pump_thread_alive() {
+    // Gate F2: refuse the enqueue while the pump thread is dead. Residual
+    // gap (disclosed): a thread dying right after this check still produces
+    // a queue entry that never replays.
+    Err(Error::OpenHarmonyWebviewError(
+      "bridge runtime pump thread is dead; the queued op would never be replayed".into(),
+    ))
   } else {
     // Not ready — queue for replay after create
     guard.push(op);
     Ok(())
   }
+}
+
+/// Gate F3 + F10 (PR#26 review round 2): the `set_bounds` production body,
+/// factored out of the inherent method exactly like [`dispatch_or_queue_op`]
+/// so the device UT can drive the REAL public-path cache write (vp
+/// conversion + dispatch + pump-guarded merge) without an `InnerWebView`:
+/// `WebviewClient` needs a live NAPI bridge session and has no NAPI-free
+/// constructor, so a UT cannot build the struct. The parameters are exactly
+/// the fields the method touches - no test-only seam.
+fn set_bounds_with_cache(
+  pending_ops: &std::sync::Mutex<Vec<PendingOp>>,
+  handle: &OnceLock<WebviewHandle>,
+  creation_error: &std::sync::Mutex<Option<String>>,
+  runtime: &BridgeExecutor,
+  bounds_cache: &Mutex<Rect>,
+  bounds: Rect,
+) -> Result<()> {
+  // #198: physical → ArkUI vp via the live display ratio (was a hardcoded
+  // 1.0; the absent-binding fallback 1.0 keeps host/UT values
+  // bit-identical — the desktop reference device reports vp=1.9).
+  let vp = virtual_pixel_ratio();
+  let (x, y) = geometry_to_logical_vp(bounds.position, vp);
+  let (w, h) = size_to_logical_vp(bounds.size, vp);
+  dispatch_or_queue_op(
+    pending_ops,
+    handle,
+    creation_error,
+    runtime,
+    PendingOp::SetBounds(x, y, w, h),
+  )?;
+  // ability-F6: the cache write skips sentinel components (the tauri
+  // -runtime-wry partial-bounds wire, issue Eulogizethesun/tauri#241), so
+  // `bounds()` readers must never see -2147483648.0 as a real component.
+  // Gate F3: with the pump thread dead the dispatch above is silently lost
+  // (the disclosed bridge-dead surface for non-devtools ops) - skipping the
+  // write keeps `bounds()` from reporting geometry the render layer never
+  // applied. TOCTOU residual gap (disclosed): a thread dying right after
+  // this check still leaves the cache written but unapplied.
+  if runtime.pump_thread_alive() {
+    merge_bounds_into_cache(&mut bounds_cache.lock().unwrap(), bounds);
+  } else {
+    log::warn!(
+      "[wry] set_bounds: bridge runtime pump thread is dead; the request will never be applied and the bounds cache is left unchanged"
+    );
+  }
+  Ok(())
 }
 
 impl InnerWebView {
@@ -723,6 +882,10 @@ impl InnerWebView {
     // State shared with callbacks
     let page_loaded = Arc::new(AtomicBool::new(false));
     let url_cache = Arc::new(Mutex::new(String::new()));
+    // Gate F11: only the devtools-gated methods touch this flag - gate the
+    // binding with them so a release build without the devtools feature has
+    // no dead local either.
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     let devtools_open = AtomicBool::new(false);
 
     // 1. Register reverse callbacks (before create)
@@ -1153,6 +1316,32 @@ impl InnerWebView {
           };
           // Spawn replay outside the lock
           let (handle_ref, pending) = pending;
+          // Gate F2 (drain leg, PR#26 review round 2): this drain is the
+          // consumption point of the pre-handshake queue
+          // (`queue_pre_handshake_open`) - once drained, a queued open's
+          // only execution path is the replay task below, polled by the
+          // same bridge pump thread. If that thread is dead at drain time
+          // the replay is never polled and a drained `SetDevtools` would
+          // latch the process-level open intent forever: release it through
+          // the shared failure handler. (The create future itself is polled
+          // by the pump thread, so the thread is alive while this branch
+          // runs; the check pins the drain-point invariant and covers an
+          // execution-model change. A thread dying right after this check
+          // is the disclosed TOCTOU residual gap - the release below could
+          // no longer run either.)
+          #[cfg(any(debug_assertions, feature = "devtools"))]
+          if !runtime_for_create.pump_thread_alive()
+            && pending
+              .iter()
+              .any(|op| matches!(op, PendingOp::SetDevtools))
+          {
+            devtools_open_failed(
+              "create drain replay",
+              &crate::Error::OpenHarmonyWebviewError(
+                "bridge runtime pump thread is dead; the queued open will never be replayed".into(),
+              ),
+            );
+          }
           runtime_for_create.spawn(async move {
             for op in pending {
               op.execute(&handle_ref).await;
@@ -1206,6 +1395,19 @@ impl InnerWebView {
       });
     }
 
+    // Gate F4 (PR#26 review round 2): the create-time seed routes through
+    // the same sentinel screening as the set_bounds cache write
+    // (`merge_bounds_into_cache`), so a `with_bounds` call carrying sentinel
+    // components never seeds the cache with them verbatim. The common paths
+    // are unaffected: the builder default (logical origin + 200x200) has no
+    // sentinel component, so the merge is a wholesale replace of the
+    // `Rect::default()` start value, and a bounds-less webview seeds from
+    // that default. The create-request style write above keeps using the
+    // unfiltered `initial_bounds` - the wire carries the raw request and the
+    // ArkTS render layer does its own sentinel skipping.
+    let mut bounds_cache_seed = Rect::default();
+    merge_bounds_into_cache(&mut bounds_cache_seed, initial_bounds);
+
     Ok(Self {
       id,
       handle: handle_slot,
@@ -1215,7 +1417,8 @@ impl InnerWebView {
       runtime,
       page_loaded,
       url_cache,
-      bounds_cache: Mutex::new(initial_bounds),
+      bounds_cache: Mutex::new(bounds_cache_seed),
+      #[cfg(any(debug_assertions, feature = "devtools"))]
       devtools_open,
       incognito,
       disposed: AtomicBool::new(false),
@@ -1324,8 +1527,11 @@ impl InnerWebView {
         // never polled (neither succeeding nor reaching the async
         // `devtools_open_failed`), so release the intent here. Residual gap
         // (disclosed known limitation): a thread that dies right after this
-        // check leaves the intent latched until a later open re-enters the
-        // dispatch path.
+        // check latches the intent for the rest of the process - a later
+        // `open_devtools` early-returns on the fence and never re-enters the
+        // dispatch path (the swap latch clears only via `close_devtools` or
+        // a failure release), matching the documented DEVTOOLS_ENABLED
+        // limitation above.
         if !self.runtime.pump_thread_alive() {
           devtools_open_failed(
             "open_devtools",
@@ -1583,11 +1789,16 @@ impl InnerWebView {
   /// MAIN webview - a child webview created with the same default gets the
   /// placeholder written as EXPLICIT create geometry (`is_child &&
   /// bounds.is_some()`), so `bounds()` reads back the requested 200x200 until
-  /// a later write replaces it. Callers must not use this value to
+  /// a later write replaces it. Conversely, a MAIN webview created WITH an
+  /// explicit `with_bounds` writes no create geometry at all (the style write
+  /// is gated on `is_child && bounds.is_some()`) while the cache still holds
+  /// the explicit rectangle - the "requested but never applied" case. Callers
+  /// must not use this value to
   /// reconstruct or fill in unknown geometry components: tauri-runtime-wry's
   /// i32::MIN sentinels (partial `set_bounds` updates, issue
-  /// Eulogizethesun/tauri#241) never enter the cache - a sentinel-carrying
-  /// axis keeps its cached value ([`merge_bounds_into_cache`]) - so a cached
+  /// Eulogizethesun/tauri#241) never enter the cache - a sentinel component
+  /// keeps its cached value while the set components of the same request
+  /// update theirs ([`merge_bounds_into_cache`]) - so a cached
   /// component reflects only the last real write through the builder or
   /// `set_bounds`.
   ///
@@ -1604,18 +1815,14 @@ impl InnerWebView {
   }
 
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
-    // #198: physical → ArkUI vp via the live display ratio (was a hardcoded
-    // 1.0; the absent-binding fallback 1.0 keeps host/UT values
-    // bit-identical — the desktop reference device reports vp=1.9).
-    let vp = virtual_pixel_ratio();
-    let (x, y) = geometry_to_logical_vp(bounds.position, vp);
-    let (w, h) = size_to_logical_vp(bounds.size, vp);
-    self.dispatch_or_queue(PendingOp::SetBounds(x, y, w, h))?;
-    // ability-F6: the cache write skips sentinel components (the tauri
-    // -runtime-wry partial-bounds wire, issue Eulogizethesun/tauri#241), so
-    // `bounds()` readers must never see -2147483648.0 as a real component.
-    merge_bounds_into_cache(&mut self.bounds_cache.lock().unwrap(), bounds);
-    Ok(())
+    set_bounds_with_cache(
+      &self.pending_ops,
+      &self.handle,
+      &self.creation_error,
+      &self.runtime,
+      &self.bounds_cache,
+      bounds,
+    )
   }
 
   pub fn set_visible(&self, visible: bool) -> Result<()> {
@@ -2677,6 +2884,36 @@ mod tests {
     );
   }
 
+  /// Gate F6 (round 2): a Physical sentinel component maps 1:1 onto the
+  /// sentinel LOGICAL value instead of being divided by vp - the ArkTS render
+  /// layer screens logical values by exact sentinel equality, and a blind
+  /// division would destroy that exact value and apply the sentinel as a real
+  /// position. Real components still convert normally, and Logical sentinels
+  /// pass through unchanged. PhysicalSize has no sentinel arm: its u32
+  /// components can never equal the negative sentinel (documented on
+  /// `size_to_logical_vp`).
+  /// # Brief: 1) convert Physical(i32::MIN, 100) at vp=1.9 and assert the
+  /// sentinel x is exact while y converts 2) same at vp=1.0 3) a Logical
+  /// sentinel pair passes through unchanged.
+  #[test]
+  fn ut_geometry_to_logical_vp_maps_physical_sentinel_without_division() {
+    let sentinel = i32::MIN as f64;
+    let p = dpi::PhysicalPosition::new(i32::MIN, 100_i32);
+    let (x, y) = geometry_to_logical_vp(dpi::Position::Physical(p), 1.9);
+    assert_eq!(x, sentinel, "sentinel x must not be divided by vp");
+    assert!(
+      (y - 100.0 / 1.9).abs() < 1e-9,
+      "a real component converts normally"
+    );
+    let (x, y) = geometry_to_logical_vp(dpi::Position::Physical(p), 1.0);
+    assert_eq!(x, sentinel, "sentinel x stays exact at the identity ratio");
+    assert_eq!(y, 100.0);
+    let l = dpi::LogicalPosition::new(sentinel, 5.0);
+    let (x, y) = geometry_to_logical_vp(dpi::Position::Logical(l), 1.9);
+    assert_eq!(x, sentinel, "a Logical sentinel passes through unchanged");
+    assert_eq!(y, 5.0);
+  }
+
   /// UT for #198: the wrapper's sanitize guard is deterministic — ≤0, NaN and
   /// ±inf fall back to exactly 1.0 (never a division hazard), real ratios pass
   /// through untouched. The LIVE binding value is device-real (1.9 on the
@@ -2973,11 +3210,41 @@ mod tests {
   // future would otherwise never be polled and the idempotence fence would
   // latch forever).
 
+  /// Gate F9 (round 2): a BridgeExecutor whose pump thread reports FINISHED -
+  /// the exact observable state `pump_thread_alive` consumes in production
+  /// once the thread has terminated. The production death mechanism (the
+  /// `block_on(pending())` thread actually terminating) cannot be triggered
+  /// from a UT, so the state is fabricated at the probe's observation point:
+  /// a real JoinHandle of a thread that already exited. The `handle` field is
+  /// a live executor's handle - the paths under test (probe, queue arm) never
+  /// spawn through it.
+  fn dead_pump_executor_for_ut() -> BridgeExecutor {
+    let live = BridgeExecutor::new();
+    let finished = std::thread::Builder::new()
+      .name("ut-dead-pump".into())
+      .spawn(|| {})
+      .expect("failed to spawn the ut pump stand-in thread");
+    let mut waited_ms = 0_u64;
+    while !finished.is_finished() {
+      std::thread::sleep(std::time::Duration::from_millis(1));
+      waited_ms += 1;
+      assert!(
+        waited_ms < 2000,
+        "the ut pump stand-in thread never finished"
+      );
+    }
+    BridgeExecutor {
+      handle: live.handle.clone(),
+      pump_thread: Arc::new(Mutex::new(finished)),
+    }
+  }
+
   /// Gate F5: `pump_thread_alive` reports a live pump thread for a healthy
   /// executor (the probe the ready-branch `open_devtools` consults after
-  /// spawning). The dead side of the probe (a terminated pump thread) cannot be
-  /// produced deterministically here: the shared runtime's thread is owned by
-  /// the process-wide executor, so this UT pins only the healthy arm.
+  /// spawning). The dead side of the probe cannot be produced by an actually
+  /// terminated pump thread here (the shared runtime's thread is owned by the
+  /// process-wide executor); it is pinned by the simulated-state UT below
+  /// (`ut_bridge_executor_pump_thread_alive_probe_dead_side_simulated`).
   /// # Brief: 1) get the executor 2) assert `pump_thread_alive` is true.
   #[test]
   fn ut_bridge_executor_pump_thread_alive_probe_healthy() {
@@ -2988,6 +3255,83 @@ mod tests {
     );
   }
 
+  /// Gate F9 (round 2): the DEAD side of the `pump_thread_alive` probe,
+  /// simulated at its observation point (a finished JoinHandle stand-in).
+  /// Production thread death itself stays un-simulatable in a UT (disclosed);
+  /// this pins the probe's false arm that the ready-branch and queue-arm
+  /// dead-pump guards consume.
+  /// # Brief: 1) build the simulated-dead-pump executor 2) assert the probe
+  /// reports false.
+  #[test]
+  fn ut_bridge_executor_pump_thread_alive_probe_dead_side_simulated() {
+    let runtime = dead_pump_executor_for_ut();
+    assert!(
+      !runtime.pump_thread_alive(),
+      "a finished pump-thread stand-in must report the dead state"
+    );
+  }
+
+  /// Gate F2 (round 2): the pre-handshake QUEUE arm refuses an op when the
+  /// bridge runtime's pump thread is already dead (the create drain that
+  /// would replay it is polled by that very thread), and the open_devtools
+  /// layer releases the just-recorded intent - the synchronous-Err leg now
+  /// covers the queue arm too. The dead-pump STATE is simulated at the
+  /// probe's observation point (a finished JoinHandle stand-in, see
+  /// `dead_pump_executor_for_ut`); the production thread-death mechanism
+  /// itself stays un-simulatable (disclosed, Gate F9).
+  /// # Brief: 1) build the simulated-dead-pump executor 2) assert
+  /// `dispatch_or_queue_op` refuses the op synchronously and the queue stays
+  /// empty 3) run the real `queue_pre_handshake_open` and assert the intent
+  /// is released and a later open dispatches again.
+  #[cfg(any(debug_assertions, feature = "devtools"))]
+  #[test]
+  fn ut_queue_arm_dead_pump_refuses_op_and_releases_devtools_intent() {
+    let _guard = devtools_ut_lock();
+    let saved = DEVTOOLS_ENABLED.load(Ordering::SeqCst);
+    DEVTOOLS_ENABLED.store(false, Ordering::SeqCst);
+
+    let runtime = dead_pump_executor_for_ut();
+    assert!(
+      !runtime.pump_thread_alive(),
+      "the stand-in must report the dead-pump state"
+    );
+
+    let queue: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
+    let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    assert!(
+      dispatch_or_queue_op(
+        &queue,
+        &handle,
+        &creation_error,
+        &runtime,
+        PendingOp::Reload
+      )
+      .is_err(),
+      "a dead pump must refuse the queue entry synchronously"
+    );
+    assert!(
+      queue.lock().unwrap().is_empty(),
+      "the dead-pump queue arm must not accept the op"
+    );
+
+    // open_devtools' None arm: the intent is flipped, then the queue attempt
+    // hits the dead pump - the Err releases the intent (no latch).
+    assert!(devtools_open_intent(), "the open flips the intent first");
+    queue_pre_handshake_open(&queue, &handle, &creation_error, &runtime);
+    assert!(
+      !DEVTOOLS_ENABLED.load(Ordering::SeqCst),
+      "the dead-pump queue arm must release the open intent"
+    );
+    assert!(
+      devtools_open_intent(),
+      "after the release a later open must dispatch again"
+    );
+
+    DEVTOOLS_ENABLED.store(saved, Ordering::SeqCst);
+  }
+
   // ability-F6 (PR#26 review gate): tauri-runtime-wry's partial set_bounds
   // requests (issue Eulogizethesun/tauri#241) carry the i32::MIN sentinel for
   // the components a call does not set. The public bounds cache must never
@@ -2996,13 +3340,17 @@ mod tests {
 
   /// ability-F6: `merge_bounds_into_cache` is the exact cache write of
   /// `set_bounds`, so what it leaves in the cache is what `bounds()` reads
-  /// back. A sentinel-carrying axis keeps its cached value; an axis with only
-  /// real components is replaced; a full request still replaces the cache
-  /// wholesale (the pre-fix behavior must survive for full writes).
+  /// back. A sentinel-carrying component keeps its cached value; a component
+  /// with only real values is replaced; a full request still replaces the
+  /// cache wholesale (the pre-fix behavior must survive for full writes).
+  /// Gate F5 (round 2): the merge is per COMPONENT - a mixed partial applies
+  /// its real component while keeping the sentinel one, matching the ArkTS
+  /// render granularity.
   /// # Brief: 1) seed the cache with the builder-default placeholder 2) merge
   /// a SetSize-shaped partial (sentinel position pair) 3) assert no -2^31
   /// component, preserved position, applied size 4) merge a SetPosition-shaped
-  /// partial 5) merge a full request and assert the wholesale replace.
+  /// partial 5) merge two mixed partials and assert per-component results
+  /// 6) merge a full request and assert the wholesale replace.
   #[test]
   fn ut_set_bounds_sentinel_components_never_enter_the_bounds_cache() {
     fn components(r: &Rect) -> (f64, f64, f64, f64) {
@@ -3052,6 +3400,37 @@ mod tests {
     assert_eq!(w, 320.0, "sentinel size keeps the cached value");
     assert_eq!(h, 240.0, "sentinel size keeps the cached value");
 
+    // Gate F5 (round 2): a mixed partial updates per COMPONENT, matching the
+    // ArkTS render granularity - the sentinel x keeps the cached value while
+    // the real y of the same request is applied (the whole-axis merge would
+    // have discarded the real y).
+    merge_bounds_into_cache(
+      &mut cache,
+      Rect {
+        position: dpi::LogicalPosition::new(sentinel, 45.0).into(),
+        size: dpi::LogicalSize::new(sentinel, sentinel).into(),
+      },
+    );
+    let (x, y, w, h) = components(&cache);
+    assert_eq!(x, 15.0, "sentinel x keeps the cached value");
+    assert_eq!(y, 45.0, "real y of the mixed partial is applied");
+    assert_eq!(w, 320.0, "sentinel width keeps the cached value");
+    assert_eq!(h, 240.0, "sentinel height keeps the cached value");
+
+    // Mirrored mixed partial: real x + sentinel y, and a mixed size partial.
+    merge_bounds_into_cache(
+      &mut cache,
+      Rect {
+        position: dpi::LogicalPosition::new(25.0, sentinel).into(),
+        size: dpi::LogicalSize::new(400.0, sentinel).into(),
+      },
+    );
+    let (x, y, w, h) = components(&cache);
+    assert_eq!(x, 25.0, "real x of the mixed partial is applied");
+    assert_eq!(y, 45.0, "sentinel y keeps the cached value");
+    assert_eq!(w, 400.0, "real width of the mixed partial is applied");
+    assert_eq!(h, 240.0, "sentinel height keeps the cached value");
+
     // Control: a full request (no sentinel component) replaces the cache
     // wholesale, including across variants.
     merge_bounds_into_cache(
@@ -3066,6 +3445,56 @@ mod tests {
     assert_eq!(y, 6.0, "a full request replaces the position wholesale");
     assert_eq!(w, 7.0, "a full request replaces the size wholesale");
     assert_eq!(h, 8.0, "a full request replaces the size wholesale");
+  }
+
+  /// Gate F10 (round 2): the set_bounds PUBLIC path pins the merge call
+  /// site - a mixed partial driven through the production body
+  /// (`set_bounds_with_cache`, the exact body `InnerWebView::set_bounds`
+  /// delegates to) reads back per-component through the bounds() shape (the
+  /// cache deref). The body is factored out exactly like
+  /// `dispatch_or_queue_op` because a UT cannot build `InnerWebView`:
+  /// `WebviewClient` needs a live NAPI bridge session and has no NAPI-free
+  /// constructor.
+  /// # Brief: 1) seed the cache 2) run the real set_bounds body with a mixed
+  /// partial (sentinel x + real y, real w + sentinel h) 3) read back and
+  /// assert the per-component results 4) assert the op was queued for replay.
+  #[test]
+  fn ut_set_bounds_public_path_mixed_partial_reads_back_per_component() {
+    let pending_ops: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
+    let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let runtime = BridgeExecutor::new();
+    let bounds_cache = Mutex::new(Rect {
+      position: dpi::LogicalPosition::new(10.0, 20.0).into(),
+      size: dpi::LogicalSize::new(100.0, 50.0).into(),
+    });
+
+    set_bounds_with_cache(
+      &pending_ops,
+      &handle,
+      &creation_error,
+      &runtime,
+      &bounds_cache,
+      Rect {
+        position: dpi::LogicalPosition::new(i32::MIN as f64, 30.0).into(),
+        size: dpi::LogicalSize::new(200.0, i32::MIN as f64).into(),
+      },
+    )
+    .expect("a live pump must accept the op");
+
+    // bounds() read-back shape: `Ok(*bounds_cache.lock().unwrap())`.
+    let cached = *bounds_cache.lock().unwrap();
+    let (x, y) = position_components(cached.position);
+    let (w, h) = size_components(cached.size);
+    assert_eq!(x, 10.0, "sentinel x keeps the cached value");
+    assert_eq!(y, 30.0, "real y is applied (per-component merge)");
+    assert_eq!(w, 200.0, "real width is applied (per-component merge)");
+    assert_eq!(h, 50.0, "sentinel height keeps the cached value");
+    assert_eq!(
+      pending_ops.lock().unwrap().len(),
+      1,
+      "the live-pump path queues the op for replay"
+    );
   }
 
   // #189 (design D3): the unified dispose fence.
