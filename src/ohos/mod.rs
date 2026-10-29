@@ -327,7 +327,8 @@ fn url_with_main_thread_refresh(
 /// bridge (`WebviewPdfConfig`) and mapped per-field into ArkWeb's
 /// `PdfConfiguration` (width/height in inches) — see WebviewPlugin.ets
 /// `createPdf`. `scale` is forwarded into `PdfConfiguration.scale` (ArkTS
-/// side, #233; the system field is @since 20) instead of being dropped.
+/// side, #233; the system field is @since 14, per its single d.ts doc
+/// block) instead of being dropped.
 pub struct PdfConfig {
   pub width: Option<f64>,
   pub height: Option<f64>,
@@ -1276,10 +1277,11 @@ impl InnerWebView {
         // #188 (design D9): forward the incognito flag through the new
         // `WebviewStyle.incognito` wire field (Option<bool>,
         // skip-serialized): `true` maps to `Some(true)` -- the ArkTS receiver
-        // sets `Web().incognitoMode(true)` (SDK20 @since 20) and carries the
-        // flag to the cookie sync bridge as its third parameter; the default
-        // `false` stays `None`, keeping the payload byte-identical to the
-        // pre-#188 wire (zero change for existing apps).
+        // passes `incognitoMode: true` as a `Web({...})` constructor option
+        // (`WebOptions.incognitoMode`, d.ts first doc block @since 11) and
+        // carries the flag to the cookie sync bridge as its third parameter;
+        // the default `false` stays `None`, keeping the payload byte-identical
+        // to the pre-#188 wire (zero change for existing apps).
         incognito: incognito.then_some(true),
         ..Default::default()
       })
