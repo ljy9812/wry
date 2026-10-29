@@ -646,8 +646,9 @@ fn devtools_close_intent() -> bool {
 /// [`failed_create_cleanup`] for a queued open that can never replay.
 /// Factored out so the device UT exercises the real failure path.
 /// Device-gated: `src/ohos` is entirely `#[cfg(target_env = "ohos")]`, so its
-/// UTs are only compiled and executed when the crate targets
-/// aarch64-unknown-linux-ohos; a host `cargo test` never builds them.
+/// UTs are only compiled and executed when the crate targets an
+/// `*-unknown-linux-ohos` target (the aarch64 device or the x86_64
+/// emulator); a host `cargo test` never builds them.
 ///
 /// Race note (inherent to the async latch, identical to
 /// [`failed_create_cleanup`]): a concurrent `open_devtools` that consulted the
@@ -712,7 +713,8 @@ pub(crate) struct InnerWebView {
 /// the intent (an earlier applied open makes `open_devtools` an early-return
 /// idempotent no-op, never a queue entry). Factored out of the create-failure
 /// closure so the device UT exercises the real cleanup (device-gated: only
-/// compiled and executed when targeting aarch64-unknown-linux-ohos).
+/// compiled and executed when targeting an `*-unknown-linux-ohos` target --
+/// the aarch64 device or the x86_64 emulator).
 fn failed_create_cleanup(guard: &mut Vec<PendingOp>) {
   #[cfg(any(debug_assertions, feature = "devtools"))]
   if guard.iter().any(|op| matches!(op, PendingOp::SetDevtools)) {
@@ -1580,10 +1582,13 @@ impl InnerWebView {
   // Devtools: bridge action
   //
   // #195: previously a pre-handshake open was silently dropped (`try_handle`
-  // -> None) -- tauri-runtime-wry calls open_devtools right after creation, so
-  // on the OHOS delayed-attach path the intent vanished. Now the intent is
-  // recorded in the process-level flag first, and a pre-handshake open is
-  // queued as `PendingOp::SetDevtools` for the create drain to replay.
+  // -> None) -- the embedding app's setup hook (e.g. the demo suite's
+  // `#[cfg(debug_assertions)] webview.open_devtools()`, routed through
+  // tauri-runtime-wry's dispatcher and its OpenDevTools message arm) calls
+  // open_devtools right after creation, so on the OHOS delayed-attach path
+  // the intent vanished. Now the intent is recorded in the process-level flag
+  // first, and a pre-handshake open is queued as `PendingOp::SetDevtools` for
+  // the create drain to replay.
   //
   // W26-4: no *failure path* latches the idempotence gate for the rest of
   // the process - every failure path releases the process-level intent: a
@@ -1915,9 +1920,12 @@ impl InnerWebView {
   /// request with explicit bounds renders the webview at the requested size
   /// (not inflated to the container; the style write is child-only: a MAIN
   /// create never carries bounds, even with `with_bounds`), and a runtime
-  /// `set_bounds` applies position AND size --
-  /// flipping a natural-layout (bounds-less) webview away from container
-  /// following. A bounds-less webview keeps natural layout: the wrapper renders
+  /// `set_bounds` carrying explicit width/height (a full request, or a
+  /// SetSize-shaped partial) applies position AND size -- flipping a
+  /// natural-layout (bounds-less) webview away from container following; a
+  /// SetPosition-shaped first request (size pair = `i32::MIN` sentinel,
+  /// skipped by this render layer) leaves natural layout in place. A
+  /// bounds-less webview keeps natural layout: the wrapper renders
   /// at "100%" and follows window resizes through container layout.
   pub fn bounds(&self) -> Result<Rect> {
     Ok(*self.bounds_cache.lock().unwrap())
@@ -2405,8 +2413,9 @@ fn parse_cookie_string(cookie_str: &str) -> Vec<Cookie<'static>> {
 #[cfg(test)]
 mod tests {
   // Device-gated: `src/ohos` is entirely `#[cfg(target_env = "ohos")]`, so the
-  // UTs below are only compiled and executed when the crate targets
-  // aarch64-unknown-linux-ohos. A host `cargo test` never builds them;
+  // UTs below are only compiled and executed when the crate targets an
+  // `*-unknown-linux-ohos` target (the aarch64 device or the x86_64
+  // emulator). A host `cargo test` never builds them;
   // receipts for these tests must come from a device-target test binary run.
   use super::*;
   use cookie::SameSite;
@@ -3292,7 +3301,8 @@ mod tests {
   /// through the REAL shared failure handler, so one failure can never latch
   /// the idempotence gate and swallow every later open_devtools in the
   /// process. Device-gated: this UT only compiles and executes when targeting
-  /// aarch64-unknown-linux-ohos (`src/ohos` never builds on a host).
+  /// an `*-unknown-linux-ohos` target (the aarch64 device or the x86_64
+  /// emulator; `src/ohos` never builds on a host).
   /// # Brief: 1) flip the intent 2) run the real `devtools_open_failed` 3)
   /// assert the intent is released and a later open dispatches again.
   #[cfg(any(debug_assertions, feature = "devtools"))]

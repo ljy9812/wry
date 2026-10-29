@@ -639,6 +639,11 @@ struct WebViewAttributes<'a> {
   /// - **Android:** When [addDocumentStartJavaScript] is not supported,
   ///   we prepend them to each HTML head (implementation only supported on custom protocol URLs).
   ///   For remote URLs, we use [onPageStarted] which is not guaranteed to run before other scripts.
+  /// - **OpenHarmony:** scripts are injected via ArkWeb `ScriptItem`s into
+  ///   every frame matching the script rules (`"*"` plus the registered
+  ///   custom schemes); each script's `for_main_frame_only` flag is ignored.
+  ///   Whether `file://` pages are covered by the `"*"` rule is unverified --
+  ///   do not assume injection there until probed on a device.
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
   /// [onPageStarted]: https://developer.android.com/reference/android/webkit/WebViewClient#onPageStarted(android.webkit.WebView,%20java.lang.String,%20android.graphics.Bitmap)
@@ -1005,6 +1010,14 @@ impl<'a> WebViewBuilder<'a> {
   /// - **Android:** When [addDocumentStartJavaScript] is not supported,
   ///   we prepend them to each HTML head (implementation only supported on custom protocol URLs).
   ///   For remote URLs, we use [onPageStarted] which is not guaranteed to run before other scripts.
+  /// - **OpenHarmony:** scripts are injected via ArkWeb `ScriptItem`s into
+  ///   every frame matching the script rules (`"*"` plus the registered
+  ///   custom schemes). Whether `file://` pages are covered by the `"*"`
+  ///   rule is unverified -- do not assume injection there until probed on
+  ///   a device. This variant delegates to
+  ///   [`with_initialization_script_for_main_only`] with
+  ///   `for_main_frame_only = true`, a flag OHOS ignores, so both variants
+  ///   take the same OHOS injection path.
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
   /// [onPageStarted]: https://developer.android.com/reference/android/webkit/WebViewClient#onPageStarted(android.webkit.WebView,%20java.lang.String,%20android.graphics.Bitmap)
@@ -2373,10 +2386,13 @@ impl WebView {
   ///   requested size (not inflated to the container; the style write is
   ///   child-only, so a MAIN create never carries bounds -- its `with_bounds`
   ///   rect is cache-only, see the matrix above), and a runtime
-  ///   `set_bounds` applies position AND size -- flipping a natural-layout
-  ///   (bounds-less) webview away from container following. A bounds-less
-  ///   webview keeps natural layout: it renders at "100%" and follows
-  ///   window resizes through container layout.
+  ///   `set_bounds` that carries explicit width/height -- a full request, or
+  ///   a SetSize-shaped partial -- applies position AND size, flipping a
+  ///   natural-layout (bounds-less) webview away from container following; a
+  ///   SetPosition-shaped first request (size pair = `i32::MIN` sentinel,
+  ///   skipped by the ArkTS render layer) leaves natural layout in place. A
+  ///   bounds-less webview keeps natural layout: it renders at "100%" and
+  ///   follows window resizes through container layout.
   pub fn bounds(&self) -> Result<Rect> {
     self.webview.bounds()
   }
@@ -2401,7 +2417,11 @@ impl WebView {
   /// create style write is gated `is_child && bounds.is_some()`, so a MAIN
   /// create never carries geometry -- even MAIN with explicit `with_bounds`
   /// applies nothing at create, its requested rect is cache-only), and the
-  /// first `set_bounds` on either row flips it. See the render semantics note
+  /// first `set_bounds` on either row flips it -- where "the first
+  /// `set_bounds`" means one carrying explicit width/height (a full request,
+  /// or a SetSize-shaped partial); a SetPosition-shaped first request (size
+  /// pair = `i32::MIN` sentinel, skipped by the ArkTS render layer) leaves
+  /// both rows in natural layout. See the render semantics note
   /// on [`WebView::bounds`].
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
     self.webview.set_bounds(bounds)
@@ -2813,6 +2833,11 @@ pub struct InitializationScript {
   /// - **Windows**: scripts are always injected into subframes regardless of this option.
   ///   This will be the case until Webview2 implements a proper API to inject a script only on the main frame.
   /// - **Android**: When [addDocumentStartJavaScript] is not supported, scripts are always injected into main frame only.
+  /// - **OpenHarmony**: this option is ignored -- scripts are injected into
+  ///   every frame matching the script rules (`"*"` plus the registered
+  ///   custom schemes). Whether `file://` pages are covered by the `"*"`
+  ///   rule is unverified -- do not assume injection there until probed on
+  ///   a device.
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
   pub for_main_frame_only: bool,
