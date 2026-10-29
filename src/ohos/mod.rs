@@ -453,6 +453,19 @@ impl BridgeExecutor {
   /// load_url, print, ...) stays silently lost on a dead pump - the
   /// disclosed bridge-dead surface, deliberately left as is (PR#26 review
   /// round 2, F3).
+  ///
+  /// A third disclosed exception sits on a different axis - not a dead pump
+  /// but a FAILED create (`create` returns Err / `creation_error` set):
+  /// (a) ops already sitting in the pre-handshake pending queue are never
+  /// replayed - later dispatches observe the latched error and return Err
+  /// (the creation-failed arm of `dispatch_or_queue_op`), but the queued
+  /// pre-handshake ops themselves are dropped outright by
+  /// `failed_create_cleanup` (cleared, not drained/replayed); and
+  /// (b) the bounds cache keeps the last requested geometry (the create Err
+  /// arm performs no rollback), so that webview's `bounds()` permanently
+  /// reports requested-but-never-applied values - the "until the handshake
+  /// completes and the queue drains" qualifier on the pending-handshake
+  /// cache write above never arrives.
   pub(crate) fn spawn<F>(&self, future: F)
   where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -1088,6 +1101,13 @@ impl InnerWebView {
     // against the real page URL instead of the about:blank fallback. `url()`
     // shares this cache -- before navigation it now returns the initial URL
     // rather than an empty string (benign, more truthful).
+    // Main-branch exception: on the Main dispatch path,
+    // `url_with_main_thread_refresh` first runs the synchronous cache refresh
+    // (`refresh_url_cache_from_bridge`), which writes ArkWeb's CURRENT url --
+    // about:blank before the first navigation -- into this same cache
+    // unconditionally, overwriting the prefill. The "before the first
+    // navigation `url()` returns the initial URL" guarantee therefore holds
+    // only on the Worker / Uninitialized paths.
     *url_cache.lock().unwrap() =
       url_cache_prefill(initial_url.as_deref(), use_https, &shared_for_intercept);
 
@@ -3634,6 +3654,14 @@ mod tests {
   /// and the second call (double Drop / double dispose) is a no-op.
   /// # Brief: 1) dispose three times 2) assert only the first reports a
   /// dispatch owed and the flag ends true.
+  ///
+  /// Coverage boundary (disclosed): this UT validates the fence MECHANISM on
+  /// a bare `AtomicBool`. The production dispatch side -- the main webview's
+  /// `Remove` dispatch in `dispose_child` (previously gated by the
+  /// `is_child` check that the #189 fix removed) -- has no NAPI-free test
+  /// seam (`WebviewClient` needs a live NAPI bridge session), so a
+  /// regression there does not fail this UT. Disclosed only; no new
+  /// assertion is added for it.
   #[test]
   fn ut_dispose_fence_fires_once_and_double_drop_is_noop() {
     let disposed = AtomicBool::new(false);
