@@ -2316,12 +2316,14 @@ impl WebView {
   ///
   /// ## Platform-specific:
   ///
-  /// - **OpenHarmony**: additionally clears the webview's non-incognito cookie
-  ///   store (persistent and session cookies) via
-  ///   `WebCookieManager.clearAllCookiesSync(false)` before the browsing-data
-  ///   cleanup (#191; availability-guarded, a missing/throwing API only warns).
-  ///   Not cleared: SSL cache and clientAuthCache -- the SDK exposes no public
-  ///   API for them.
+  /// - **OpenHarmony**: additionally clears cookies (persistent and session)
+  ///   via `WebCookieManager.clearAllCookiesSync(false)` before the
+  ///   browsing-data cleanup (#191; availability-guarded, a missing/throwing
+  ///   API only warns). Scope disclosure: ArkWeb's `WebCookieManager` is
+  ///   process-global, not per-webview, and the `false` argument selects the
+  ///   non-incognito store -- the wipe covers that store for every webview in
+  ///   the process, not just this one. Not cleared: SSL cache and
+  ///   clientAuthCache -- the SDK exposes no public API for them.
   pub fn clear_all_browsing_data(&self) -> Result<()> {
     self.webview.clear_all_browsing_data()
   }
@@ -2386,9 +2388,10 @@ impl WebView {
   ///   requested size (not inflated to the container; the style write is
   ///   child-only, so a MAIN create never carries bounds -- its `with_bounds`
   ///   rect is cache-only, see the matrix above), and a runtime
-  ///   `set_bounds` that carries explicit width/height -- a full request, or
-  ///   a SetSize-shaped partial -- applies position AND size, flipping a
-  ///   natural-layout (bounds-less) webview away from container following; a
+  ///   `set_bounds` applies position AND size for a full request and skips
+  ///   `i32::MIN` sentinel components on partial requests -- a SetSize-shaped
+  ///   partial applies size only, still flipping a natural-layout
+  ///   (bounds-less) webview away from container following; a
   ///   SetPosition-shaped first request (size pair = `i32::MIN` sentinel,
   ///   skipped by the ArkTS render layer) leaves natural layout in place. A
   ///   bounds-less webview keeps natural layout: it renders at "100%" and

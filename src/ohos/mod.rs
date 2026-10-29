@@ -1920,13 +1920,14 @@ impl InnerWebView {
   /// request with explicit bounds renders the webview at the requested size
   /// (not inflated to the container; the style write is child-only: a MAIN
   /// create never carries bounds, even with `with_bounds`), and a runtime
-  /// `set_bounds` carrying explicit width/height (a full request, or a
-  /// SetSize-shaped partial) applies position AND size -- flipping a
-  /// natural-layout (bounds-less) webview away from container following; a
-  /// SetPosition-shaped first request (size pair = `i32::MIN` sentinel,
-  /// skipped by this render layer) leaves natural layout in place. A
-  /// bounds-less webview keeps natural layout: the wrapper renders
-  /// at "100%" and follows window resizes through container layout.
+  /// `set_bounds` applies position AND size for a full request and skips
+  /// `i32::MIN` sentinel components on partial requests -- a SetSize-shaped
+  /// partial applies size only, still flipping a natural-layout (bounds-less)
+  /// webview away from container following; a SetPosition-shaped first
+  /// request (size pair = `i32::MIN` sentinel, skipped by this render layer)
+  /// leaves natural layout in place. A bounds-less webview keeps natural
+  /// layout: the wrapper renders at "100%" and follows window resizes through
+  /// container layout.
   pub fn bounds(&self) -> Result<Rect> {
     Ok(*self.bounds_cache.lock().unwrap())
   }
