@@ -1911,9 +1911,11 @@ impl InnerWebView {
   ///
   /// # Render semantics (openspec ohos-webview-sizing)
   ///
-  /// The ArkTS render layer consumes the full geometry: a create request with
-  /// explicit bounds renders the webview at the requested size (not inflated
-  /// to the container), and a runtime `set_bounds` applies position AND size --
+  /// The ArkTS render layer consumes the full geometry: a child create
+  /// request with explicit bounds renders the webview at the requested size
+  /// (not inflated to the container; the style write is child-only: a MAIN
+  /// create never carries bounds, even with `with_bounds`), and a runtime
+  /// `set_bounds` applies position AND size --
   /// flipping a natural-layout (bounds-less) webview away from container
   /// following. A bounds-less webview keeps natural layout: the wrapper renders
   /// at "100%" and follows window resizes through container layout.

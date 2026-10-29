@@ -2369,8 +2369,10 @@ impl WebView {
   ///   flow); ArkUI-initiated layout changes (container relayout) are not
   ///   observed.
   /// - **OpenHarmony render semantics** (openspec ohos-webview-sizing): a
-  ///   create request with explicit bounds renders the webview at the
-  ///   requested size (not inflated to the container), and a runtime
+  ///   CHILD create request with explicit bounds renders the webview at the
+  ///   requested size (not inflated to the container; the style write is
+  ///   child-only, so a MAIN create never carries bounds -- its `with_bounds`
+  ///   rect is cache-only, see the matrix above), and a runtime
   ///   `set_bounds` applies position AND size -- flipping a natural-layout
   ///   (bounds-less) webview away from container following. A bounds-less
   ///   webview keeps natural layout: it renders at "100%" and follows
