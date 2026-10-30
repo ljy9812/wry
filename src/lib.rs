@@ -1015,7 +1015,7 @@ impl<'a> WebViewBuilder<'a> {
   ///   custom schemes). Whether `file://` pages are covered by the `"*"`
   ///   rule is unverified -- do not assume injection there until probed on
   ///   a device. This variant delegates to
-  ///   [`with_initialization_script_for_main_only`] with
+  ///   [`Self::with_initialization_script_for_main_only`] with
   ///   `for_main_frame_only = true`, a flag OHOS ignores, so both variants
   ///   take the same OHOS injection path.
   ///
@@ -1147,7 +1147,7 @@ impl<'a> WebViewBuilder<'a> {
   /// ## Platform-specific
   ///
   /// - **OpenHarmony:** when combined with
-  ///   [`WebViewBuilderExtOhos::with_https_scheme`], the intercept
+  ///   `WebViewBuilderExtOhos::with_https_scheme`, the intercept
   ///   channel is synchronous-only -- a responder that fires after this closure
   ///   returns (the `std::thread::spawn` pattern in the example below) has its
   ///   result **discarded** and the request passes through (committer
