@@ -614,7 +614,13 @@ struct WebViewAttributes<'a> {
   ///
   /// ## Platform-specific
   ///
-  /// **macOS / Linux / Android / iOS**: Unsupported
+  /// - **macOS / Linux / Android / iOS**: Unsupported
+  /// - **OHOS**: only controls whether the accelerator matcher consumes
+  ///   Ctrl+/-/0 before the page sees them. The engine (ArkWeb) has no
+  ///   keyboard page-zoom — Chromium keeps those accelerators in the browser
+  ///   layer, which ArkWeb does not ship — so `true` never *creates* keyboard
+  ///   zoom, it only stops the matcher from blocking. Pinch zoom is not
+  ///   gated by this flag on OHOS at all.
   pub zoom_hotkeys_enabled: bool,
 
   /// Whether load the provided html string to [`WebView`].
@@ -1332,6 +1338,13 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - Windows: Setting to `false` can't disable pinch zoom on WebView2 Runtime version before 91.0.865.0,
   ///   see <https://learn.microsoft.com/en-us/microsoft-edge/webview2/release-notes/archive?tabs=dotnetcsharp#10865-prerelease>
+  ///
+  /// - **OHOS**: gestures are never gated (no WebView2-style best-effort
+  ///   limitation); the flag only controls whether the accelerator matcher
+  ///   consumes Ctrl+/-/0. The engine (ArkWeb) has no keyboard page-zoom —
+  ///   Chromium keeps those accelerators in the browser layer, which ArkWeb
+  ///   does not ship — so `true` never *creates* keyboard zoom, it only
+  ///   stops the matcher from blocking.
   ///
   /// - **macOS / Linux / Android / iOS**: Unsupported
   pub fn with_hotkeys_zoom(mut self, zoom: bool) -> Self {

@@ -483,7 +483,15 @@ enum PendingOp {
   LoadUrlWithHeaders(String, std::collections::BTreeMap<String, String>),
   LoadHtml(String),
   Reload,
-  Zoom(f64),
+  /// The clamped absolute zoom target wry was asked for, sent verbatim to
+  /// ArkWeb. Carries no model/delta state: under absolute-target sending a
+  /// dispatch failure simply means the zoom did not happen — the platform
+  /// stays at whatever level it had and the next call again sends its own
+  /// absolute target — so there is nothing to roll back (see
+  /// [`InnerWebView::zoom`]).
+  Zoom {
+    target: f64,
+  },
   SetBackgroundColor(String),
   SetVisible(bool),
   SetBounds(f64, f64, f64, f64),
@@ -533,9 +541,15 @@ impl PendingOp {
           log::warn!("[wry] pending reload failed: {}", e);
         }
       }
-      PendingOp::Zoom(scale) => {
-        if let Err(e) = handle.set_zoom(scale).await {
+      PendingOp::Zoom { target } => {
+        if let Err(e) = handle.set_zoom(target).await {
           log::warn!("[wry] pending set_zoom failed: {}", e);
+          // A failure here means the target never reached ArkWeb — a
+          // transport/instance error (ArkWeb itself never rejects a zoom
+          // call; out-of-range factors are silently ignored, which is the
+          // clamp's job at the `zoom` entry, not this arm's). Nothing was
+          // optimistically advanced (absolute-target sending keeps no
+          // model), so there is nothing to roll back.
         }
       }
       PendingOp::SetBackgroundColor(color) => {
@@ -724,19 +738,6 @@ pub(crate) struct InnerWebView {
   page_loaded: Arc<AtomicBool>,
   url_cache: Arc<Mutex<String>>,
   bounds_cache: Mutex<Rect>,
-  /// Tracked model of this webview's current ArkWeb page zoom, used by
-  /// [`InnerWebView::zoom`] to convert wry's absolute `set_zoom` contract
-  /// into ArkWeb's multiplicative `WebviewController.zoom` input
-  /// (delta = target / model, then model = target). Seeded at 1.0 (the
-  /// default page zoom) because ArkWeb exposes no zoom getter — the zoom
-  /// family is setters only (`zoom` / `zoomIn` x1.25 / `zoomOut` x0.8) —
-  /// so the current level has to be tracked cache-on-set. Drift
-  /// disclosure: ArkWeb-native zoom paths outside wry — zoom hotkeys (on
-  /// by default; the `zoomHotkeys` creation flag only BLOCKS them when
-  /// disabled) and pinch gestures — change ArkWeb zoom without touching
-  /// this model, so a `set_zoom` issued after a native zoom acts on a
-  /// stale baseline.
-  zoom_model: Mutex<f64>,
   /// Per-webview devtools open-state flag (#253) - written by `open_devtools`
   /// / `close_devtools`, read by `is_devtools_open`. It mirrors the actual
   /// open state, not the request intent: set on a success-shaped open path
@@ -1042,6 +1043,25 @@ impl InnerWebView {
         (handler.0)(event.title);
       });
     }
+
+    // Scale-change diagnostic (always registered): ArkWeb's `onScaleChange`
+    // fires for every zoom change source — programmatic `zoom()`, pinch —
+    // and is the ONLY observable of the webview's actual zoom level: ArkWeb
+    // exposes no zoom getter, and its `zoom()` outcome is nondeterministic
+    // from non-steady states (see [`InnerWebView::zoom`]). Logged at debug
+    // level — no wry public API surfaces webview zoom changes (tao's
+    // `ScaleFactorChanged` is display DPI, a different axis). The
+    // registration also keeps the bridge's "scale-change" event routing
+    // under live traffic: the ArkTS side only forwards events a Rust
+    // consumer registered for, so without this consumer the (fixed)
+    // routing in plugin-webview would sit unexercised and a future
+    // consumer would silently receive nothing until wry registers one.
+    callbacks_builder = callbacks_builder.on_scale_change(|event| {
+      log::debug!(
+        "[wry] webview zoom scale: {} -> {}",
+        event.old_scale, event.new_scale
+      );
+    });
 
     // Download started handler (FnMut, needs Mutex)
     if let Some(download_started_handler) = download_started_handler {
@@ -1599,7 +1619,6 @@ impl InnerWebView {
       page_loaded,
       url_cache,
       bounds_cache: Mutex::new(bounds_cache_seed),
-      zoom_model: Mutex::new(1.0),
       #[cfg(any(debug_assertions, feature = "devtools"))]
       devtools_open,
       incognito,
@@ -1807,31 +1826,37 @@ impl InnerWebView {
 
   // Pattern A: fire-and-forget
   pub fn zoom(&self, scale_factor: f64) -> Result<()> {
-    // Absolute-to-relative conversion: ArkWeb's `WebviewController.zoom`
-    // takes a factor RELATIVE to the current page zoom (zoomIn x1.25 /
-    // zoomOut x0.8 are the same family; there is no getter to read the
-    // real level), while wry's contract — and every other backend's
-    // (webview2 SetZoomFactor, wkwebview setPageZoom, gtk
-    // set_zoom_level) — is an absolute target. The model is advanced
-    // BEFORE dispatch so pre-handshake queued ops stay self-consistent:
-    // each queued delta was computed against the model as of its own
-    // call, and in-order replay preserves the product. See the
-    // `zoom_model` field for the native-hotkey drift disclosure.
-    let arkweb_factor = {
-      let mut model = self.zoom_model.lock().unwrap();
-      // The model starts at 1.0 and is only advanced to positive finite
-      // targets below, so the division is always well-defined. A
-      // non-positive / non-finite target is NOT written to the model — it
-      // flows to the bridge verbatim, which rejects it with its own
-      // logged error (upstream wry does not pre-validate the factor
-      // either: webview2 clamps, ArkWeb throws).
-      let delta = scale_factor / *model;
-      if scale_factor > 0.0 && scale_factor.is_finite() {
-        *model = scale_factor;
-      }
-      delta
+    // Absolute target, clamped to ArkWeb's effective window (webview2
+    // `SetZoomFactor` parity: clamp instead of reject — upstream wry does
+    // not pre-validate the factor on other backends either). A
+    // non-positive / non-finite factor is NOT clamped: it passes through
+    // so the handle layer rejects it with its own logged error
+    // (plugin-webview's `set_zoom` is_finite precheck) instead of wry
+    // silently mapping garbage onto 1.0.
+    //
+    // ArkWeb's `WebviewController.zoom()` input semantics are NOT a clean
+    // counterpart of wry's absolute contract — measured by driving the JS
+    // plugin path on an API 23 desktop device (2026-11-13): a factor in
+    // the documented (0, 100] range applies with the RESULT clamped to
+    // [1.0, 4.0]; the FIRST call from a clean state lands ≈ the factor;
+    // but a call following another `zoom()` or a native pinch can RESET
+    // the visual viewport to 1.0 or silently no-op (promise Ok, no
+    // error, no event). No input value removes that nondeterminism, so
+    // this backend sends the plain clamped target — the same input the
+    // JS plugin path (`window.__TAURI__.webview.setZoom`) sends, so both
+    // routes into `WebviewController.zoom` behave identically — and
+    // treats the actual outcome as observable-only (onScaleChange debug
+    // log; see the scale-change registration in `new_inner`).
+    // webview2-grade determinism is approximated on the
+    // first-call-from-clean path only.
+    const MIN_PAGE_ZOOM: f64 = 1.0;
+    const MAX_PAGE_ZOOM: f64 = 4.0;
+    let target = if scale_factor > 0.0 && scale_factor.is_finite() {
+      scale_factor.clamp(MIN_PAGE_ZOOM, MAX_PAGE_ZOOM)
+    } else {
+      scale_factor
     };
-    self.dispatch_or_queue(PendingOp::Zoom(arkweb_factor))?;
+    self.dispatch_or_queue(PendingOp::Zoom { target })?;
     Ok(())
   }
 
