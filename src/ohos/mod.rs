@@ -1002,6 +1002,7 @@ impl InnerWebView {
     let window_id = pl_attrs.window_id.unwrap_or(0);
     let use_https = pl_attrs.use_https;
     let drag_drop_overlay = pl_attrs.drag_drop_overlay;
+    let fullscreen_changed_handler = pl_attrs.fullscreen_changed_handler;
     let bridge_runtime = pl_attrs.bridge_runtime.ok_or_else(|| {
       Error::OpenHarmonyInitError(
         "BridgeRuntime not provided — call with_bridge_runtime() on the builder".into(),
@@ -1062,6 +1063,17 @@ impl InnerWebView {
         event.old_scale, event.new_scale
       );
     });
+
+    // Element-fullscreen handler (gated by registration): the page requested
+    // `requestFullscreen()` (ArkWeb `onFullScreenEnter`/`onFullScreenExit`).
+    // Forwarded as entering=true/false so the embedding runtime can drive
+    // window fullscreen (Windows `ContainsFullScreenElementChanged` parity).
+    if let Some(fullscreen_changed_handler) = fullscreen_changed_handler {
+      let handler = Arc::new(SendSyncBox(fullscreen_changed_handler));
+      callbacks_builder = callbacks_builder.on_fullscreen_change(move |event| {
+        (handler.0)(event.entering);
+      });
+    }
 
     // Download started handler (FnMut, needs Mutex)
     if let Some(download_started_handler) = download_started_handler {

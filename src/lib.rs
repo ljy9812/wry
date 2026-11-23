@@ -2027,6 +2027,12 @@ pub struct PlatformSpecificWebViewAttributes {
   pub drag_drop_overlay: bool,
   /// Bridge runtime for constructing `WebviewClient` (passed from tao's Window).
   pub bridge_runtime: Option<openharmony_ability::BridgeRuntime>,
+  /// Invoked when the page enters/exits element fullscreen (ArkWeb
+  /// `onFullScreenEnter`/`onFullScreenExit`, i.e. `requestFullscreen()`).
+  /// The `bool` is `true` on enter, `false` on exit. The runtime uses it to
+  /// drive window fullscreen automatically (Windows
+  /// `ContainsFullScreenElementChanged` parity).
+  pub fullscreen_changed_handler: Option<Box<dyn Fn(bool)>>,
 }
 
 #[cfg(target_env = "ohos")]
@@ -2067,6 +2073,18 @@ pub trait WebViewBuilderExtOhos {
   /// Must be called before `build()`. The runtime is obtained from
   /// `tao::platform::ohos::WindowExtOpenHarmony::bridge_runtime()`.
   fn with_bridge_runtime(self, runtime: openharmony_ability::BridgeRuntime) -> Self;
+
+  /// Registers a callback fired when the page enters or exits element fullscreen
+  /// (ArkWeb `onFullScreenEnter`/`onFullScreenExit`, i.e. `requestFullscreen()`).
+  /// The callback receives `true` on enter and `false` on exit. Must be called
+  /// before `build()`.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** delivered through the webview bridge
+  ///   `fullscreen-change` ack event; gated by the create-time subscription
+  ///   snapshot, so without this handler ArkTS never forwards fullscreen events.
+  fn with_fullscreen_changed_handler(self, callback: impl Fn(bool) + 'static) -> Self;
 }
 
 #[cfg(target_env = "ohos")]
@@ -2088,6 +2106,11 @@ impl WebViewBuilderExtOhos for WebViewBuilder<'_> {
 
   fn with_bridge_runtime(mut self, runtime: openharmony_ability::BridgeRuntime) -> Self {
     self.platform_specific.bridge_runtime = Some(runtime);
+    self
+  }
+
+  fn with_fullscreen_changed_handler(mut self, callback: impl Fn(bool) + 'static) -> Self {
+    self.platform_specific.fullscreen_changed_handler = Some(Box::new(callback));
     self
   }
 }
