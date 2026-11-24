@@ -13,9 +13,9 @@ use http::{Request, Response, Uri};
 use openharmony_ability::MainThreadStatus;
 use openharmony_ability_plugin_webview::{
   Either, WebviewCallbacksBuilder, WebviewClient, WebviewCreateRequest,
-  WebviewDownloadStartResponse, WebviewHandle, WebviewHttpsInterceptResponse,
-  WebviewInitializationScript, WebviewJavascriptProxyBuilder, WebviewPdfConfig, WebviewProtocol,
-  WebviewProtocolOptions, WebviewStyle,
+  WebviewDownloadStartResponse, WebviewFullScreenChangeEvent, WebviewHandle,
+  WebviewHttpsInterceptResponse, WebviewInitializationScript, WebviewJavascriptProxyBuilder,
+  WebviewPdfConfig, WebviewProtocol, WebviewProtocolOptions, WebviewStyle,
 };
 
 /// Re-exported so the runtime layer (`tauri-runtime-wry`) can register the
@@ -203,13 +203,27 @@ fn size_components(s: dpi::Size) -> (f64, f64) {
 /// cached axis is kept wholesale (conservative, the pre-F5 whole-axis
 /// behavior).
 ///
-/// The dispatched `PendingOp::SetBounds` is unaffected either way: the wire
-/// carries the vp-converted request and the ArkTS render layer does its own
-/// sentinel skipping; this merge only governs the read-back bookkeeping.
+/// Review #29 (NaN / ±inf screening): a NON-FINITE component counts as "not
+/// set", exactly like the sentinel. The merge used to judge only
+/// `!= I32_MIN_SENTINEL`, so a NaN / ±inf component (reachable input class:
+/// only a hand-crafted `LogicalPosition` / `LogicalSize` — a `Physical`
+/// variant widens from i32/u32 and can never be non-finite) passed the
+/// sentinel test and was written into the cache verbatim, leaving
+/// `bounds()` readers with a NaN / ±inf component until some later real
+/// `set_bounds` overwrote it. With the gate the component keeps its cached
+/// value instead — the same "unset component" semantics the sentinel path
+/// already documents. Boundary (disclosed): this gate governs the cache
+/// read-back only, like the sentinel screening — the dispatched
+/// `PendingOp::SetBounds` still carries the raw vp conversion, and the ArkTS
+/// render layer's behavior on non-finite geometry is a device-side question
+/// outside this contract.
 fn merge_bounds_into_cache(cache: &mut Rect, incoming: Rect) {
   let (ix, iy) = position_components(incoming.position);
-  let x_set = ix != I32_MIN_SENTINEL;
-  let y_set = iy != I32_MIN_SENTINEL;
+  // Review #29: `is_finite` screens NaN / ±inf alongside the sentinel —
+  // NaN != sentinel, so the old check alone classified non-finite input as
+  // "set".
+  let x_set = ix != I32_MIN_SENTINEL && ix.is_finite();
+  let y_set = iy != I32_MIN_SENTINEL && iy.is_finite();
   match (&mut cache.position, incoming.position) {
     // Same-variant: true per-component merge - the units are comparable.
     (dpi::Position::Logical(c), dpi::Position::Logical(i)) => {
@@ -239,8 +253,8 @@ fn merge_bounds_into_cache(cache: &mut Rect, incoming: Rect) {
     }
   }
   let (iw, ih) = size_components(incoming.size);
-  let w_set = iw != I32_MIN_SENTINEL;
-  let h_set = ih != I32_MIN_SENTINEL;
+  let w_set = iw != I32_MIN_SENTINEL && iw.is_finite();
+  let h_set = ih != I32_MIN_SENTINEL && ih.is_finite();
   match (&mut cache.size, incoming.size) {
     (dpi::Size::Logical(c), dpi::Size::Logical(i)) => {
       if w_set {
@@ -573,6 +587,39 @@ fn schedule_print_temp_cleanup(path: &str) {
   }
 }
 
+/// Review #18: the pure clamp behind [`InnerWebView::zoom`], factored out so
+/// the device UT exercises the exact production formula. A finite factor in
+/// (0, ∞) is clamped to [1.0, 4.0] (webview2 `SetZoomFactor` parity: clamp
+/// instead of reject); 0.0 / negative finite factors are NOT clamped — no
+/// layer rejects them, they reach `WebviewController.zoom` verbatim (see the
+/// `zoom` entry comment) — and NaN / ±inf pass through unclamped so the
+/// handle layer's `is_finite` precheck rejects them instead of wry silently
+/// mapping garbage onto 1.0.
+fn clamp_zoom_target(scale_factor: f64) -> f64 {
+  const MIN_PAGE_ZOOM: f64 = 1.0;
+  const MAX_PAGE_ZOOM: f64 = 4.0;
+  if scale_factor > 0.0 && scale_factor.is_finite() {
+    scale_factor.clamp(MIN_PAGE_ZOOM, MAX_PAGE_ZOOM)
+  } else {
+    scale_factor
+  }
+}
+
+/// Review #18: the wry-owned hop of the element-fullscreen chain — the
+/// registration closure [`InnerWebView::new_inner`] installs via
+/// `on_fullscreen_change`. Factored out so the device UT can drive the exact
+/// payload mapping: the wry hop forwards `entering` VERBATIM (enter=true /
+/// exit=false, Windows `ContainsFullScreenElementChanged` parity) and adds
+/// nothing. The upstream legs (ArkTS `onFullScreenEnter`/`Exit` → ability
+/// `dispatch_fullscreen_change`, guarded by `controller::is_current`) are
+/// crate-internal to plugin-webview and have no in-repo test seam — this UT
+/// covers the one leg wry owns.
+fn fullscreen_forwarder(
+  handler: Arc<SendSyncBox<Box<dyn Fn(bool)>>>,
+) -> impl Fn(WebviewFullScreenChangeEvent) + Send + Sync + 'static {
+  move |event| (handler.0)(event.entering)
+}
+
 impl PendingOp {
   async fn execute(self, handle: &WebviewHandle) {
     match self {
@@ -669,6 +716,14 @@ impl PendingOp {
       }
       PendingOp::CreatePdf(path, config, callback) => {
         let result = handle.create_pdf(&path, config).await;
+        // Review #28: the failure arm used to be the only execute() arm without
+        // a warn — callback(false) is observable but carries no cause, so the
+        // hilog line is the only troubleshooting lead (bridge timeout vs
+        // PRINT-flow engine error vs path/IO failure). Same shape as the
+        // SetCookie/Eval arms above.
+        if let Err(e) = &result {
+          log::warn!("[wry] create_pdf failed: {}", e);
+        }
         let success = result.is_ok();
         if let Some(cb) = callback {
           cb(success);
@@ -909,6 +964,7 @@ fn queue_pre_handshake_open(
   handle: &OnceLock<WebviewHandle>,
   creation_error: &std::sync::Mutex<Option<String>>,
   runtime: &BridgeExecutor,
+  disposed: &AtomicBool,
   flag: &Arc<AtomicBool>,
 ) {
   if let Err(e) = dispatch_or_queue_op(
@@ -916,6 +972,7 @@ fn queue_pre_handshake_open(
     handle,
     creation_error,
     runtime,
+    disposed,
     // #253: the queueing webview's open-state flag travels with the op --
     // the replay sets it on success and every never-replayed path clears it.
     PendingOp::SetDevtools(Arc::clone(flag)),
@@ -929,6 +986,17 @@ fn queue_pre_handshake_open(
     );
   }
 }
+
+/// Review #17: the bound on the pre-handshake op queue
+/// ([`dispatch_or_queue_op`]). The queue only drains once the create
+/// handshake completes, so without a cap an embedding loop dispatching
+/// while create is pending grows it without bound (each `Eval` carries a
+/// JS string and a callback closure). 1024 is far above any legitimate
+/// pre-handshake traffic (setup hooks issue single-digit op counts: an
+/// open_devtools, an initial zoom/navigation, a few evals) while bounding
+/// the memory a pathological caller can pin; the refusal is an explicit
+/// Err, not a silent drop.
+const PRE_HANDSHAKE_QUEUE_CAP: usize = 1024;
 
 /// m4: the dispatch-or-queue decision + enqueue, factored out of the inherent
 /// method so the device UT exercises the REAL production path (queue /
@@ -945,16 +1013,63 @@ fn queue_pre_handshake_open(
 /// [`queue_pre_handshake_open`] release the process-level intent (making the
 /// synchronous-Err claim true on the queue arm too); for every other op it
 /// turns a silent never-replayed queue entry into a surfaced error.
+///
+/// Review #15 (ordering contract): post-ready ops are dispatched as
+/// INDEPENDENT spawned tasks — no cross-op ordering is contractual. The
+/// pre-handshake queue replays strictly sequentially (one drain task awaiting
+/// each op in queue order), so a sequence issued before the handshake
+/// preserves its order; the same sequence issued after the handshake does
+/// NOT contractually: observed arrival order rides the bridge executor's
+/// single pump thread (spawn order ≈ poll start order), an implementation
+/// detail rather than an API guarantee. Callers whose ops depend on each
+/// other's effects must not rely on back-to-back call order — under the
+/// absolute-target zoom semantics, for example, an arrival-order flip turns
+/// "the last zoom wins" into "the first zoom wins".
+///
+/// Review #16 (disposal fence): ops ARRIVING after
+/// [`InnerWebView::dispose_child`] set the fence are refused with an Err
+/// instead of being dispatched onto a torn-down webview (where they would
+/// surface only as an async bridge Err logged at warn, while the caller had
+/// already received `Ok(())`) — the op-side counterpart of the event side's
+/// `controller::is_current` stale-dispatch guard. The `Remove` op itself is
+/// exempt: it IS the disposal teardown signal and is dispatched BY
+/// `dispose_child` after the fence is set. Boundary (disclosed): ops queued
+/// BEFORE the fence still replay through the create drain — they were
+/// accepted pre-dispose, mirroring the event side's in-flight events; the
+/// fence governs the arrival point only.
+///
+/// Review #17 (queue cap): the pre-handshake queue is bounded by
+/// [`PRE_HANDSHAKE_QUEUE_CAP`]. The queue is replayed only once the create
+/// handshake completes, so an embedding loop dispatching while create stays
+/// pending (each `Eval` carrying a JS string and a callback closure) could
+/// otherwise grow it without bound; beyond the cap the op is refused with an
+/// Err — the same synchronous-refusal shape as the creation-failed and
+/// dead-pump arms (which also means the devtools open releases its intent,
+/// see [`queue_pre_handshake_open`]). The cap sits AFTER the dead-pump check:
+/// a dead pump is the more precise refusal and fires first.
 fn dispatch_or_queue_op(
   pending_ops: &std::sync::Mutex<Vec<PendingOp>>,
   handle: &OnceLock<WebviewHandle>,
   creation_error: &std::sync::Mutex<Option<String>>,
   runtime: &BridgeExecutor,
+  disposed: &AtomicBool,
   op: PendingOp,
 ) -> Result<()> {
+  // Review #16: the disposal fence. Checked BEFORE the queue lock is taken —
+  // no lock interplay with dispose_child, which sets the fence and then
+  // dispatches the exempt `Remove`.
+  if !matches!(op, PendingOp::Remove) && disposed.load(Ordering::SeqCst) {
+    return Err(Error::OpenHarmonyWebviewError(
+      "webview disposed; the op would never be applied".into(),
+    ));
+  }
   let mut guard = pending_ops.lock().unwrap();
   if let Some(handle) = handle.get() {
-    // Handle is ready -- release lock and spawn
+    // Handle is ready -- release lock and spawn.
+    //
+    // Review #15: this arm is the "no cross-op ordering is contractual"
+    // surface — each op becomes its own task here (see the fn doc for the
+    // contract and the pre-handshake contrast).
     let handle = handle.clone();
     drop(guard);
     runtime.spawn(async move {
@@ -973,6 +1088,12 @@ fn dispatch_or_queue_op(
     Err(Error::OpenHarmonyWebviewError(
       "bridge runtime pump thread is dead; the queued op would never be replayed".into(),
     ))
+  } else if guard.len() >= PRE_HANDSHAKE_QUEUE_CAP {
+    // Review #17: bound the pre-handshake queue (see the fn doc).
+    Err(Error::OpenHarmonyWebviewError(format!(
+      "pre-handshake queue is full ({} ops); refusing to grow it without bound while create is still pending",
+      PRE_HANDSHAKE_QUEUE_CAP
+    )))
   } else {
     // Not ready -- queue for replay after create
     guard.push(op);
@@ -992,6 +1113,7 @@ fn set_bounds_with_cache(
   handle: &OnceLock<WebviewHandle>,
   creation_error: &std::sync::Mutex<Option<String>>,
   runtime: &BridgeExecutor,
+  disposed: &AtomicBool,
   bounds_cache: &Mutex<Rect>,
   bounds: Rect,
 ) -> Result<()> {
@@ -1006,6 +1128,7 @@ fn set_bounds_with_cache(
     handle,
     creation_error,
     runtime,
+    disposed,
     PendingOp::SetBounds(x, y, w, h),
   )?;
   // ability-F6: the cache write skips sentinel components (the
@@ -1165,25 +1288,36 @@ impl InnerWebView {
       });
     }
 
-    // Scale-change diagnostic (always registered): ArkWeb's `onScaleChange`
-    // fires for every zoom change source — programmatic `zoom()`, pinch —
-    // and is the ONLY observable of the webview's actual zoom level: ArkWeb
-    // exposes no zoom getter, and its `zoom()` outcome is nondeterministic
-    // from non-steady states (see [`InnerWebView::zoom`]). Logged at debug
-    // level — no wry public API surfaces webview zoom changes (tao's
-    // `ScaleFactorChanged` is display DPI, a different axis). The
-    // registration also keeps the bridge's "scale-change" event routing
-    // under live traffic: the ArkTS side only forwards events a Rust
-    // consumer registered for, so without this consumer the (fixed)
-    // routing in plugin-webview would sit unexercised and a future
-    // consumer would silently receive nothing until wry registers one.
-    callbacks_builder = callbacks_builder.on_scale_change(|event| {
-      log::debug!(
-        "[wry] webview zoom scale: {} -> {}",
-        event.old_scale,
-        event.new_scale
-      );
-    });
+    // Scale-change diagnostic (debug builds only, review #13): ArkWeb's
+    // `onScaleChange` fires for every zoom change source — programmatic
+    // `zoom()`, pinch — and is the ONLY observable of the webview's actual
+    // zoom level: ArkWeb exposes no zoom getter, and its `zoom()` outcome is
+    // nondeterministic from non-steady states (see [`InnerWebView::zoom`]).
+    // Logged at debug level — no wry public API surfaces webview zoom changes
+    // (tao's `ScaleFactorChanged` is display DPI, a different axis).
+    //
+    // Review #13 (gated registration): this registration used to be
+    // unconditional, which cost every webview one bridge round trip per
+    // pinch/zoom event for a single debug log line (only visible with
+    // `hilog -b D`). Its sole product is the create snapshot's scale-change
+    // flag — it participates in no wry state — so release builds no longer
+    // register: their create request carries no scale-change subscription and
+    // the ArkTS side forwards nothing (the same symmetric
+    // registered-flag-gates-traffic shape the fullscreen handler uses), zero
+    // bridge traffic. Debug builds keep the diagnostic AND keep the bridge's
+    // "scale-change" event routing under live traffic: the ArkTS side only
+    // forwards events a Rust consumer registered for, so the (fixed) routing
+    // in plugin-webview stays exercised where the log is actually readable.
+    #[cfg(debug_assertions)]
+    {
+      callbacks_builder = callbacks_builder.on_scale_change(|event| {
+        log::debug!(
+          "[wry] webview zoom scale: {} -> {}",
+          event.old_scale,
+          event.new_scale
+        );
+      });
+    }
 
     // Element-fullscreen handler (gated by registration): the page requested
     // `requestFullscreen()` (ArkWeb `onFullScreenEnter`/`onFullScreenExit`).
@@ -1191,9 +1325,7 @@ impl InnerWebView {
     // window fullscreen (Windows `ContainsFullScreenElementChanged` parity).
     if let Some(fullscreen_changed_handler) = fullscreen_changed_handler {
       let handler = Arc::new(SendSyncBox(fullscreen_changed_handler));
-      callbacks_builder = callbacks_builder.on_fullscreen_change(move |event| {
-        (handler.0)(event.entering);
-      });
+      callbacks_builder = callbacks_builder.on_fullscreen_change(fullscreen_forwarder(handler));
     }
 
     // Download started handler (FnMut, needs Mutex)
@@ -1826,6 +1958,7 @@ impl InnerWebView {
       &self.handle,
       &self.creation_error,
       &self.runtime,
+      &self.disposed,
       op,
     )
   }
@@ -2006,6 +2139,7 @@ impl InnerWebView {
         &self.handle,
         &self.creation_error,
         &self.runtime,
+        &self.disposed,
         &self.devtools_open,
       ),
     }
@@ -2062,17 +2196,12 @@ impl InnerWebView {
     // this backend sends the plain clamped target — the same input the
     // JS plugin path (`window.__TAURI__.webview.setZoom`) sends, so both
     // routes into `WebviewController.zoom` behave identically — and
-    // treats the actual outcome as observable-only (onScaleChange debug
-    // log; see the scale-change registration in `new_inner`).
+    // treats the actual outcome as observable-only (the onScaleChange debug
+    // log, registered in debug builds only — review #13; see the
+    // scale-change registration in `new_inner`).
     // webview2-grade determinism is approximated on the
     // first-call-from-clean path only.
-    const MIN_PAGE_ZOOM: f64 = 1.0;
-    const MAX_PAGE_ZOOM: f64 = 4.0;
-    let target = if scale_factor > 0.0 && scale_factor.is_finite() {
-      scale_factor.clamp(MIN_PAGE_ZOOM, MAX_PAGE_ZOOM)
-    } else {
-      scale_factor
-    };
+    let target = clamp_zoom_target(scale_factor);
     self.dispatch_or_queue(PendingOp::Zoom { target })?;
     Ok(())
   }
@@ -2086,7 +2215,20 @@ impl InnerWebView {
   // Pattern D: blocking-from-worker (worker threads) / sync bridge (main
   // thread) — cookies
   pub fn cookies(&self) -> Result<Vec<Cookie<'static>>> {
-    let url = self.url_cache.lock().unwrap().clone();
+    // Review #25: read the current URL through the same three-state router
+    // `url()` uses instead of the raw event cache — on the Main thread the
+    // synchronous bridge refresh (`refresh_url_cache_from_bridge`) picks up
+    // SPA pushState navigations the page-begin/end events never observe, so
+    // the cookie read targets the page the user actually sees (identical to
+    // `url()`'s freshness contract). Worker / Uninitialized keep the
+    // cache-only behavior (no bridge touch, matching `url()`'s arms); the
+    // residual staleness window there is the navigation-start → page-begin
+    // gap, same as before.
+    let url = url_with_main_thread_refresh(
+      openharmony_ability::main_thread_status(),
+      &self.id,
+      &self.url_cache,
+    )?;
     if url.is_empty() {
       return Ok(vec![]);
     }
@@ -2162,14 +2304,27 @@ impl InnerWebView {
       MainThreadStatus::Worker => {
         let handle = match self.try_handle() {
           Some(h) => h,
-          None => return Ok(vec![]),
+          // Review #26: create not completed -- this used to be a silent empty
+          // result, the same false "no cookies" answer the async bridge failure
+          // below used to give. All three thread paths now agree: a fetch that
+          // did not happen is an Err, never an empty Ok (the caller can then
+          // distinguish "no cookies for this URL" from "could not read").
+          None => {
+            return Err(Error::OpenHarmonyWebviewError(
+              "cookies_for_url: webview handle not ready (create has not completed)".into(),
+            ));
+          }
         };
         let url = url.to_string();
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = mpsc::channel();
         self.runtime.spawn(async move {
-          let result = handle.cookies_with_url(url).await;
-          let _ = tx.send(result.unwrap_or_default());
+          let _ = tx.send(handle.cookies_with_url(url).await);
         });
+        // Review #26: the fetch Result travels through the channel so the
+        // worker arm propagates the bridge error like the Main / Uninitialized
+        // / timeout paths do (this arm used to swallow Err into
+        // `unwrap_or_default()`, i.e. `Ok(vec![])` -- the only error-swallowing
+        // path of the API).
         let cookie_str = rx
           // Safe to block here: the Worker classification above guarantees we
           // are on a worker thread, so the TSFN callback (which runs on the
@@ -2177,7 +2332,8 @@ impl InnerWebView {
           // "blocking-from-worker" pattern; the forbidden variant is blocking
           // the MAIN thread.
           .recv_timeout(std::time::Duration::from_secs(3))
-          .map_err(|_| Error::OpenHarmonyWebviewError("cookies_for_url timed out".into()))?;
+          .map_err(|_| Error::OpenHarmonyWebviewError("cookies_for_url timed out".into()))?
+          .map_err(|e| Error::OpenHarmonyWebviewError(format!("cookies_for_url: {e}")))?;
         Ok(parse_cookie_string(&cookie_str))
       }
       // The render entry has not run yet, so we cannot prove which thread we
@@ -2341,6 +2497,7 @@ impl InnerWebView {
       &self.handle,
       &self.creation_error,
       &self.runtime,
+      &self.disposed,
       &self.bounds_cache,
       bounds,
     )
@@ -2390,9 +2547,37 @@ impl InnerWebView {
   /// never dispatched at all - no bridge request is issued and nothing waits
   /// on one - so there is no pending call to time out and no hang to bound.
   /// No unbounded hang on either side.
+  ///
+  /// Review #14 (registry cleanup): the Rust-side registry entries are
+  /// dropped here too, not only the ArkTS component. Sibling backends own
+  /// their handler closures inside the `WebView` struct, so dropping the
+  /// struct drops them; on OHOS the bundle (including the fullscreen handler
+  /// closures and their captures) lives in plugin-webview's PROCESS-GLOBAL
+  /// `CALLBACKS` registry keyed by webview id, so it must be removed
+  /// explicitly or it stays resident until process end. The
+  /// create-failure path already had this cleanup
+  /// ([`WebviewClient::rollback_registrations`], review #2); dispose reuses
+  /// the same entry point — it drops exactly the per-webview dead weight
+  /// (callbacks bundle, queued js-proxy declarations, per-webview scheme
+  /// declarations) while leaving the process-global scheme set untouched.
+  /// Semantics notes: (a) the cleanup runs while the ArkTS `Remove` teardown
+  /// is in flight — an event arriving in that window finds no bundle and is
+  /// dropped, the same fail-silent shape as the event side's
+  /// `controller::is_current` rejection; (b) idempotent — a create that
+  /// already failed rolled the same entries back, a second pass removes
+  /// nothing; (c) the shared entry point's log line says "for failed create"
+  /// — that text is the ability side's create-rollback wording, reused here
+  /// for the dispose case.
   pub fn dispose_child(&self) {
     if dispose_once(&self.disposed) {
       let _ = self.dispatch_or_queue(PendingOp::Remove);
+      if let Err(e) = self.client.rollback_registrations(&self.id) {
+        log::warn!(
+          "[wry] dispose_child: dropping the registry entries for '{}' failed: {}",
+          self.id,
+          e
+        );
+      }
     }
   }
 
@@ -2730,11 +2915,37 @@ fn rgba_to_argb_hex(color: RGBA) -> String {
 
 /// Converts an `http::HeaderMap` into the bridge's `BTreeMap<String, String>`
 /// form (header names as strings; non-UTF-8 values become empty).
+/// Builds the request-header map the bridge wire carries (a
+/// name → single-string-value map on the ArkTS side).
+///
+/// Review #27 (duplicate names): `HeaderMap::iter()` yields one entry PER
+/// VALUE, and the former `collect::<BTreeMap<_, _>>()` structurally kept only
+/// the LAST value for a repeated name — earlier values silently vanished
+/// (repeated `Set-Cookie`-style names and duplicated custom headers). The
+/// wire shape has no per-value line form (webview2's one-line-per-value
+/// rendering is not representable in a map), so duplicate values are
+/// COMMA-JOINed into `", "`-separated order-preserving list form — the
+/// RFC 9110 field-value combination for list-based header fields — instead of
+/// last-value-wins. Callers sending non-list headers with the same name twice
+/// should not expect engine-side re-splitting; that residual is a wire-shape
+/// limit, disclosed rather than fixable without a cross-repo wire change.
+/// Non-UTF-8 values still degrade to the empty string (pre-existing
+/// disclosed behavior).
 fn headers_to_btree(headers: &http::HeaderMap) -> std::collections::BTreeMap<String, String> {
-  headers
-    .iter()
-    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-    .collect()
+  // The explicit value type is load-bearing: `and_modify`'s closure parameter
+  // type must be fixed before `or_insert_with` resolves the entry's value.
+  let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+  for (k, v) in headers.iter() {
+    let value = v.to_str().unwrap_or("");
+    map
+      .entry(k.as_str().to_string())
+      .and_modify(|existing| {
+        existing.push_str(", ");
+        existing.push_str(value);
+      })
+      .or_insert_with(|| value.to_string());
+  }
+  map
 }
 
 /// Formats an `OffsetDateTime` as an RFC 6265 section 5.1.1 IMF-fixdate string in
@@ -3718,6 +3929,9 @@ mod tests {
     let queue: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
     let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
     let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Review #16: the disposal fence travels with the real signature; this UT
+    // keeps it clear (not disposed) -- the fence behavior has its own UT.
+    let disposed = AtomicBool::new(false);
     let runtime = BridgeExecutor::new();
 
     // Pre-handshake: both ops land in the production queue, order preserved.
@@ -3728,6 +3942,7 @@ mod tests {
       &handle,
       &creation_error,
       &runtime,
+      &disposed,
       PendingOp::SetDevtools(Arc::new(AtomicBool::new(false))),
     )
     .expect("pre-handshake op must queue");
@@ -3736,6 +3951,7 @@ mod tests {
       &handle,
       &creation_error,
       &runtime,
+      &disposed,
       PendingOp::Reload,
     )
     .expect("pre-handshake op must queue");
@@ -3757,6 +3973,7 @@ mod tests {
         &handle,
         &creation_error,
         &runtime,
+        &disposed,
         PendingOp::Reload
       )
       .is_err(),
@@ -3836,6 +4053,7 @@ mod tests {
     let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
     let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let runtime = BridgeExecutor::new();
+    let disposed = AtomicBool::new(false);
 
     // open_devtools' first step flips the intent; then the None arm hits the
     // dead queue (create already failed -- the m4 state dispatch rejects).
@@ -3844,7 +4062,14 @@ mod tests {
     assert!(devtools_open_intent(), "first open must flip the intent");
     *creation_error.lock().unwrap() = Some("injected create failure".to_string());
     let dead_queue_flag = Arc::new(AtomicBool::new(false));
-    queue_pre_handshake_open(&queue, &handle, &creation_error, &runtime, &dead_queue_flag);
+    queue_pre_handshake_open(
+      &queue,
+      &handle,
+      &creation_error,
+      &runtime,
+      &disposed,
+      &dead_queue_flag,
+    );
 
     assert!(
       !DEVTOOLS_ENABLED.load(Ordering::SeqCst),
@@ -3871,6 +4096,7 @@ mod tests {
       &handle,
       &creation_error,
       &runtime,
+      &disposed,
       &healthy_queue_flag,
     );
     {
@@ -4019,6 +4245,7 @@ mod tests {
     let queue: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
     let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
     let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let disposed = AtomicBool::new(false);
 
     assert!(
       dispatch_or_queue_op(
@@ -4026,6 +4253,7 @@ mod tests {
         &handle,
         &creation_error,
         &runtime,
+        &disposed,
         PendingOp::Reload
       )
       .is_err(),
@@ -4041,7 +4269,14 @@ mod tests {
     // queue attempt carries the webview's open-state flag (scratch here).
     assert!(devtools_open_intent(), "the open flips the intent first");
     let dead_pump_flag = Arc::new(AtomicBool::new(false));
-    queue_pre_handshake_open(&queue, &handle, &creation_error, &runtime, &dead_pump_flag);
+    queue_pre_handshake_open(
+      &queue,
+      &handle,
+      &creation_error,
+      &runtime,
+      &disposed,
+      &dead_pump_flag,
+    );
     assert!(
       !DEVTOOLS_ENABLED.load(Ordering::SeqCst),
       "the dead-pump queue arm must release the open intent"
@@ -4185,6 +4420,7 @@ mod tests {
     let pending_ops: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
     let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
     let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let disposed = AtomicBool::new(false);
     let runtime = BridgeExecutor::new();
     let bounds_cache = Mutex::new(Rect {
       position: dpi::LogicalPosition::new(10.0, 20.0).into(),
@@ -4196,6 +4432,7 @@ mod tests {
       &handle,
       &creation_error,
       &runtime,
+      &disposed,
       &bounds_cache,
       Rect {
         position: dpi::LogicalPosition::new(i32::MIN as f64, 30.0).into(),
@@ -4402,6 +4639,305 @@ mod tests {
     assert!(
       !lines.iter().any(|l| l.contains("bad name")),
       "invalid header name leaked: {lines:?}"
+    );
+  }
+
+  // ─── Review #18: zoom clamp + fullscreen chain UTs ─────────────────────────
+
+  /// UT for review #18: the clamp is a pure formula — an in-range factor
+  /// passes through, factors outside [1.0, 4.0] clamp to the boundaries, and
+  /// the passthrough class (0.0 / negative finite / NaN / ±inf) is NOT
+  /// clamped (0.0 and negatives reach `WebviewController.zoom` verbatim — no
+  /// layer rejects them; NaN / ±inf are left for the handle layer's
+  /// `is_finite` precheck instead of being silently mapped onto 1.0).
+  /// # Brief: assert the six input classes against the exact expected values.
+  #[test]
+  fn ut_clamp_zoom_target_in_range_and_boundaries() {
+    // In range: passthrough (no drift).
+    assert_eq!(clamp_zoom_target(2.0), 2.0);
+    assert_eq!(clamp_zoom_target(1.0), 1.0);
+    assert_eq!(clamp_zoom_target(4.0), 4.0);
+    // Out of range, finite: clamped into the window.
+    assert_eq!(clamp_zoom_target(0.5), 1.0);
+    assert_eq!(clamp_zoom_target(10.0), 4.0);
+    // Just outside the boundaries.
+    assert_eq!(clamp_zoom_target(1.0 - 1e-12), 1.0);
+    assert_eq!(clamp_zoom_target(4.0 + 1e-12), 4.0);
+  }
+
+  /// UT for review #18: the passthrough class keeps its value verbatim —
+  /// clamping garbage onto 1.0 would turn a caller bug into a silent zoom.
+  /// # Brief: 0.0, negative finite, NaN, +inf, -inf all come back unchanged.
+  #[test]
+  fn ut_clamp_zoom_target_passthrough_class_is_not_clamped() {
+    assert_eq!(clamp_zoom_target(0.0), 0.0);
+    assert_eq!(clamp_zoom_target(-3.0), -3.0);
+    assert!(clamp_zoom_target(f64::NAN).is_nan());
+    assert_eq!(clamp_zoom_target(f64::INFINITY), f64::INFINITY);
+    assert_eq!(clamp_zoom_target(f64::NEG_INFINITY), f64::NEG_INFINITY);
+  }
+
+  /// UT for review #18: the fullscreen forwarder — the wry-owned hop of the
+  /// element-fullscreen chain — relays `entering` VERBATIM (enter=true,
+  /// exit=false) and adds nothing, so the embedding runtime's window-fullscreen
+  /// drive sees the same boolean the ArkWeb `onFullScreenEnter`/`Exit` events
+  /// carried. The upstream legs (ArkTS events → ability dispatch, guarded by
+  /// `controller::is_current`) are crate-internal to plugin-webview and have
+  /// no in-repo test seam; this UT pins the leg wry owns.
+  /// # Brief: drive the exact closure `new_inner` installs with both events
+  /// and assert the handler received `true` then `false`.
+  #[test]
+  fn ut_fullscreen_forwarder_relays_entering_verbatim() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let handler: Box<dyn Fn(bool)> = {
+      let seen = Arc::clone(&seen);
+      Box::new(move |entering| seen.lock().unwrap().push(entering))
+    };
+    let forward = fullscreen_forwarder(Arc::new(SendSyncBox(handler)));
+    forward(WebviewFullScreenChangeEvent {
+      id: "ut-w".into(),
+      native_tag: "ut-tag".into(),
+      entering: true,
+    });
+    forward(WebviewFullScreenChangeEvent {
+      id: "ut-w".into(),
+      native_tag: "ut-tag".into(),
+      entering: false,
+    });
+    assert_eq!(
+      *seen.lock().unwrap(),
+      vec![true, false],
+      "the forwarder must relay entering verbatim, in arrival order"
+    );
+  }
+
+  // ─── Review #16 + #17: disposal fence and queue cap on the dispatch chain ──
+
+  /// UT for review #16: with the disposal fence set, ops arriving at
+  /// `dispatch_or_queue_op` are refused with an Err (the op-side counterpart
+  /// of the event side's `is_current` guard — post-dispose dispatches must
+  /// surface synchronously, not ride a torn-down webview), while the
+  /// `Remove` op itself is EXEMPT (it is the disposal teardown signal that
+  /// `dispose_child` dispatches after setting the fence) and still queues.
+  /// # Brief: 1) set the fence on a scratch webview-shaped argument set
+  /// 2) assert a Reload is refused and queues nothing 3) assert a Remove is
+  /// accepted and queued.
+  #[test]
+  fn ut_dispatch_refuses_ops_after_dispose_but_remove_passes() {
+    let queue: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
+    let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let runtime = BridgeExecutor::new();
+    let disposed = AtomicBool::new(true); // fence set by dispose_child/Drop
+
+    assert!(
+      dispatch_or_queue_op(
+        &queue,
+        &handle,
+        &creation_error,
+        &runtime,
+        &disposed,
+        PendingOp::Reload
+      )
+      .is_err(),
+      "an op arriving after dispose must be refused"
+    );
+    assert!(
+      queue.lock().unwrap().is_empty(),
+      "a refused op must not queue"
+    );
+    dispatch_or_queue_op(
+      &queue,
+      &handle,
+      &creation_error,
+      &runtime,
+      &disposed,
+      PendingOp::Remove,
+    )
+    .expect("the Remove op is the disposal signal itself and must pass the fence");
+    assert_eq!(
+      queue.lock().unwrap().len(),
+      1,
+      "the exempt Remove op sits in the queue for the create-drain replay"
+    );
+  }
+
+  /// UT for review #17: the pre-handshake queue is bounded — the (cap+1)-th
+  /// op is refused with an Err instead of growing the queue without bound
+  /// while create is pending, and the first `PRE_HANDSHAKE_QUEUE_CAP` ops
+  /// still queue in order.
+  /// # Brief: 1) fill the queue to the cap 2) assert the next op is refused
+  /// 3) assert exactly `PRE_HANDSHAKE_QUEUE_CAP` ops are queued.
+  #[test]
+  fn ut_pre_handshake_queue_cap_refuses_beyond_limit() {
+    let queue: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
+    let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let runtime = BridgeExecutor::new();
+    let disposed = AtomicBool::new(false);
+
+    for _ in 0..PRE_HANDSHAKE_QUEUE_CAP {
+      dispatch_or_queue_op(
+        &queue,
+        &handle,
+        &creation_error,
+        &runtime,
+        &disposed,
+        PendingOp::Reload,
+      )
+      .expect("ops up to the cap must queue");
+    }
+    assert!(
+      dispatch_or_queue_op(
+        &queue,
+        &handle,
+        &creation_error,
+        &runtime,
+        &disposed,
+        PendingOp::Reload
+      )
+      .is_err(),
+      "the op beyond the cap must be refused"
+    );
+    assert_eq!(
+      queue.lock().unwrap().len(),
+      PRE_HANDSHAKE_QUEUE_CAP,
+      "the queue must hold exactly the capped op count"
+    );
+  }
+
+  // ─── Review #29: NaN / ±inf never enter the bounds cache ───────────────────
+
+  /// UT for review #29: a non-finite component is treated as "not set", the
+  /// same semantics as the sentinel — the cached value is kept instead of
+  /// being overwritten with NaN / ±inf (`bounds()` readers never see a
+  /// non-finite component from this path). A mixed partial still applies its
+  /// finite components, and a fully-finite request still replaces wholesale.
+  /// # Brief: 1) seed the cache 2) merge a NaN/±inf-carrying request 3) assert
+  /// the cache kept the finite prior values and applied the finite peers.
+  #[test]
+  fn ut_bounds_cache_screening_refuses_non_finite_components() {
+    let mut cache = Rect {
+      position: dpi::LogicalPosition::new(10.0, 20.0).into(),
+      size: dpi::LogicalSize::new(100.0, 50.0).into(),
+    };
+
+    // Same-variant partial: NaN x + ±inf height are screened; the finite
+    // peers (y, width) of the same request apply per component.
+    merge_bounds_into_cache(
+      &mut cache,
+      Rect {
+        position: dpi::LogicalPosition::new(f64::NAN, 30.0).into(),
+        size: dpi::LogicalSize::new(200.0, f64::NEG_INFINITY).into(),
+      },
+    );
+    let (x, y) = position_components(cache.position);
+    let (w, h) = size_components(cache.size);
+    assert_eq!(x, 10.0, "NaN x keeps the cached value");
+    assert_eq!(y, 30.0, "finite y of the same request is applied");
+    assert_eq!(w, 200.0, "finite width of the same request is applied");
+    assert_eq!(h, 50.0, "±inf height keeps the cached value");
+
+    // Control: an all-finite cross-variant request still replaces both axes
+    // wholesale.
+    merge_bounds_into_cache(
+      &mut cache,
+      Rect {
+        position: dpi::PhysicalPosition::new(5_i32, 6_i32).into(),
+        size: dpi::PhysicalSize::new(7_u32, 8_u32).into(),
+      },
+    );
+    let (x, y) = position_components(cache.position);
+    let (w, h) = size_components(cache.size);
+    assert_eq!(
+      x, 5.0,
+      "an all-finite cross-variant request replaces wholesale"
+    );
+    assert_eq!(
+      y, 6.0,
+      "an all-finite cross-variant request replaces wholesale"
+    );
+    assert_eq!(
+      w, 7.0,
+      "an all-finite cross-variant request replaces wholesale"
+    );
+    assert_eq!(
+      h, 8.0,
+      "an all-finite cross-variant request replaces wholesale"
+    );
+
+    // Cross-variant replace needs ALL components set: a NaN-carrying
+    // cross-variant request keeps the cached axis wholesale (the pre-#29
+    // merge would have replaced the axis with NaN inside).
+    merge_bounds_into_cache(
+      &mut cache,
+      Rect {
+        position: dpi::LogicalPosition::new(f64::NAN, 40.0).into(),
+        size: dpi::LogicalSize::new(f64::NAN, 70.0).into(),
+      },
+    );
+    let (x, y) = position_components(cache.position);
+    let (w, h) = size_components(cache.size);
+    assert_eq!(
+      x, 5.0,
+      "a NaN-carrying cross-variant position keeps the cached axis"
+    );
+    assert_eq!(
+      y, 6.0,
+      "a NaN-carrying cross-variant position keeps the cached axis"
+    );
+    assert_eq!(
+      w, 7.0,
+      "a NaN-carrying cross-variant size keeps the cached axis"
+    );
+    assert_eq!(
+      h, 8.0,
+      "a NaN-carrying cross-variant size keeps the cached axis"
+    );
+  }
+
+  // ─── Review #27: duplicate header names join instead of last-value-wins ────
+
+  /// UT for review #27: repeated header names are comma-joined into
+  /// order-preserving list form instead of structurally keeping only the last
+  /// value; single values pass through unchanged and a non-UTF-8 value still
+  /// degrades to the empty string.
+  /// # Brief: build a HeaderMap with one duplicated name + two singles, assert
+  /// the joined/single/empty shapes.
+  #[test]
+  fn ut_headers_to_btree_joins_duplicate_names() {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+      http::header::ACCEPT,
+      http::HeaderValue::from_static("text/html"),
+    );
+    headers.append(
+      http::header::ACCEPT,
+      http::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+      http::header::CACHE_CONTROL,
+      http::HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+      http::header::HeaderName::from_static("x-custom"),
+      http::HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+    );
+    let map = headers_to_btree(&headers);
+    assert_eq!(
+      map.get("accept").map(String::as_str),
+      Some("text/html, application/json"),
+      "duplicate values must comma-join in arrival order, not last-value-wins"
+    );
+    assert_eq!(
+      map.get("cache-control").map(String::as_str),
+      Some("no-cache"),
+      "a single value passes through unchanged"
+    );
+    assert_eq!(
+      map.get("x-custom").map(String::as_str),
+      Some(""),
+      "non-UTF-8 values degrade to the empty string (pre-existing behavior)"
     );
   }
 }
