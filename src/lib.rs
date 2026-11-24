@@ -1420,8 +1420,12 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - **Windows**: The closure is executed on a separate thread to prevent a deadlock.
   /// - **OpenHarmony**: [`NewWindowFeatures::size`] and [`NewWindowFeatures::position`] are
-  ///   always `None` (ArkWeb does not expose the requested popup geometry), and
-  ///   [`NewWindowOpener`] is an empty struct with no webview reference. Returning
+  ///   always `None`, and [`NewWindowOpener`] is an empty struct with no webview reference:
+  ///   the bridge's new-window event (ArkWeb `onWindowNew`, API 12) carries only
+  ///   targetUrl/isAlert/isUserTrigger and no feature payload, so wry always receives
+  ///   default (empty) features. ArkWeb's `onWindowNewExt` (API 23) does expose
+  ///   `windowFeatures` (size/position), but forwarding it requires a bridge wire
+  ///   addition that has not been made. Returning
   ///   [`NewWindowResponse::Create`] is treated like [`NewWindowResponse::Deny`] for the
   ///   ArkWeb popup itself: tauri builds its own OS window for the new webview and cancels
   ///   ArkWeb's popup, so `true` must never be returned for the `Create` case.
@@ -2038,6 +2042,17 @@ pub struct PlatformSpecificWebViewAttributes {
 #[cfg(target_env = "ohos")]
 pub trait WebViewBuilderExtOhos {
   /// Sets the OS-level window ID for the webview.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** a JS `window.close()` call is not delivered to the
+  ///   embedder (ArkWeb's `onWindowExit` is not wired over the bridge), and wry
+  ///   has no close-request handler field to observe one. The only honored
+  ///   close convention is a navigation to `http://close-window.invalid`, which
+  ///   the webview plugin intercepts and routes into the host window's close
+  ///   flow (a vetoable close request) **only for webviews bound to an OS
+  ///   sub-window (`window_id > 0`)**. For webviews created without a window id
+  ///   (`0`) that navigation is intercepted and swallowed with no effect.
   fn with_window_id(self, window_id: i64) -> Self;
 
   /// Enables HTTPS scheme for custom protocols.
@@ -2259,6 +2274,12 @@ impl WebView {
   /// ## Platform-specific
   ///
   /// - **Android**: Not supported.
+  /// - **OpenHarmony**: the cookie is delivered through ArkWeb's
+  ///   `configCookieSync` with a target URL derived from the cookie's `Domain`
+  ///   attribute (always sent as `https://<domain>`), falling back to the
+  ///   current page URL when the cookie carries no domain. With neither (no
+  ///   `Domain` and no page loaded yet) the call returns an error — the cookie
+  ///   is not dispatched.
   pub fn set_cookie(&self, cookie: &cookie::Cookie<'_>) -> Result<()> {
     self.webview.set_cookie(cookie)
   }
@@ -2268,6 +2289,12 @@ impl WebView {
   /// ## Platform-specific
   ///
   /// - **Android**: Not supported.
+  /// - **OpenHarmony**: Not supported (a logged no-op returning `Ok(())`).
+  ///   ArkWeb's cookie manager (`@ohos.web.webview`) exposes only fetch /
+  ///   config / bulk-clear (all cookies or all session cookies) APIs and no
+  ///   single-cookie deletion, and the webview bridge exposes no action for
+  ///   one; wry deliberately does not fall back to a bulk clear, since
+  ///   deleting cookies the caller did not ask for is not acceptable.
   pub fn delete_cookie(&self, cookie: &cookie::Cookie<'_>) -> Result<()> {
     self.webview.delete_cookie(cookie)
   }

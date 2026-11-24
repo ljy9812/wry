@@ -1137,6 +1137,25 @@ impl InnerWebView {
       callbacks_builder = callbacks_builder.on_navigation_request(move |req| !(handler.0)(req.url));
     }
 
+    // Close-window requests (review #6): deliberately NOT registered. The
+    // shared builder does expose `on_close_window`, but from ArkWeb that Rust
+    // callback is unreachable: the plugin's `handleLoadIntercept` consumes
+    // `http://close-window.invalid` navigations before the generic
+    // `onNavigationRequest` bridge call — the only path that fires the Rust
+    // close-window routing — so a wry-side registration would be a dead
+    // closure whose only observable effect is flipping the create-time
+    // `navigationIntercept` flag (an extra synchronous bridge round trip per
+    // navigation, zero behavior change). What actually works is ArkTS-side:
+    // webviews bound to an OS sub-window (`window_id > 0`, see
+    // `WebViewBuilderExtOhos::with_window_id`) get the plugin's close-window
+    // handler, which notifies the runtime close flow (a vetoable
+    // CloseRequested). For `window_id = 0` webviews the navigation is
+    // intercepted and swallowed with no effect; surfacing a close request to
+    // wry consumers would need both a plugin-side handler for windowless
+    // webviews and a cross-platform `WebViewAttributes` field wry does not
+    // have (webview2's unconditional `window.close` → `DestroyWindow` parity
+    // is therefore not reachable on this backend). Disclosed, not fixed here.
+
     // Title change handler
     if let Some(document_title_changed_handler) = document_title_changed_handler {
       let handler = Arc::new(SendSyncBox(document_title_changed_handler));
@@ -1523,10 +1542,15 @@ impl InnerWebView {
       .initialization_scripts(merged_scripts)
       .transparent(transparent);
 
-    // Set url or html
-    if let Some(html) = html {
-      create_req = create_req.html(html);
-    } else if let Some(url) = initial_url {
+    // Set url or html. `url` wins when both are provided — the documented
+    // cross-platform contract (`WebViewAttributes::html`: "This will be
+    // ignored if the `url` is provided") and the sibling backends' branch
+    // order (webview2/webkitgtk/wkwebview all test the URL first). Review #32:
+    // OHOS used to prefer `html`, contradicting the contract, and the URL
+    // cache prefill above then reported a URL the webview never loaded through
+    // `url()` and the IPC origin chain. At most one source is ever sent: the
+    // plugin's create guard rejects payloads with both (or neither) set.
+    if let Some(url) = initial_url {
       let url = if use_https && !shared_for_intercept.is_empty() {
         let rewritten = rewrite_https_url_if_matching(&url, &shared_for_intercept);
         log::info!(
@@ -1544,6 +1568,8 @@ impl InnerWebView {
       if let Some(headers) = initial_headers {
         create_req.headers = Some(headers_to_btree(&headers));
       }
+    } else if let Some(html) = html {
+      create_req = create_req.html(html);
     }
 
     // Field assignments (no builder methods for these)
@@ -2048,10 +2074,17 @@ impl InnerWebView {
         if !current_url.is_empty() {
           current_url
         } else {
+          // Review #20: this arm used to return Ok(()) — a false success: the
+          // cookie was never dispatched and the caller could not tell. The
+          // target URL is genuinely undeterminable here (no cookie `Domain`
+          // and no loaded page to inherit one from), so report the failure.
           log::warn!(
             "[wry] set_cookie: cannot determine target URL (no domain and no current URL)"
           );
-          return Ok(());
+          return Err(Error::OpenHarmonyWebviewError(
+            "set_cookie: cannot determine target URL (no cookie Domain and no current page URL)"
+              .into(),
+          ));
         }
       }
     };
@@ -2822,7 +2855,10 @@ fn eval_callback_payload<E>(result: &std::result::Result<Option<String>, E>) -> 
 
 /// Resolves the initial value of the URL cache for a created webview (#199):
 /// the normalized initial URL (same https-rewrite the create request applies)
-/// or an empty string when the webview is created from HTML with no URL.
+/// or an empty string when the webview is created from HTML with no URL. The
+/// create request prefers `url` over `html` (review #32), so a URL-seeded
+/// cache always describes the document the webview actually loads; the empty
+/// prefill only happens on the html-only shape.
 fn url_cache_prefill(
   initial_url: Option<&str>,
   use_https: bool,
