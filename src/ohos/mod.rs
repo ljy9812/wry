@@ -601,8 +601,9 @@ impl PendingOp {
           log::warn!("[wry] pending set_zoom failed: {}", e);
           // A failure here means the target never reached ArkWeb — a
           // transport/instance error (ArkWeb itself never rejects a zoom
-          // call; out-of-range factors are silently ignored, which is the
-          // clamp's job at the `zoom` entry, not this arm's). Nothing was
+          // call; out-of-range factors were already clamped to [1.0, 4.0]
+          // at the `zoom` entry, so this arm only ever sees a target within
+          // that window — no clamping happens here). Nothing was
           // optimistically advanced (absolute-target sending keeps no
           // model), so there is nothing to roll back.
         }
@@ -1196,6 +1197,16 @@ impl InnerWebView {
     }
 
     // Download started handler (FnMut, needs Mutex)
+    //
+    // Payload-fidelity notes (ArkTS delivers the assigned path via
+    // `event.start(response.tempPath ?? engineSuggestedPath)`):
+    // * a non-UTF-8 assigned path makes `to_str()` yield `None` — the
+    //   assignment is silently dropped and the engine's suggested path is
+    //   used instead;
+    // * with no suggested path and nothing assigned, `path` is an empty
+    //   `PathBuf`, so `temp_path` is `Some("")` — and an empty string does
+    //   NOT fall through the JS `??` (it only skips `null`/`undefined`), so
+    //   the engine fallback never applies and the engine gets `""`.
     if let Some(download_started_handler) = download_started_handler {
       let handler = Arc::new(Mutex::new(SendSyncBox(download_started_handler)));
       callbacks_builder = callbacks_builder.on_download_start(move |req| {
@@ -1355,6 +1366,13 @@ impl InnerWebView {
       .map_err(|e| Error::OpenHarmonyInitError(e.to_string()))?;
 
     // 3. Register IPC handler via WebviewJavascriptProxyBuilder (before create)
+    //
+    // The IPC request URI is served from the page begin/end event cache
+    // (`url_cache`), NOT from the engine's URL at message time (webview2
+    // reads the source URL per message). Consequences: after a same-origin
+    // history rewrite (`pushState`) the URI carries the stale path; and a
+    // webview that has not navigated yet (html-only creation) reports
+    // `about:blank` — the pre-navigation fallback the unit tests keep.
     let id_for_ipc = id.clone();
     let url_cache_ipc = url_cache.clone();
     if let Some(ipc_handler) = ipc_handler {
@@ -1502,11 +1520,17 @@ impl InnerWebView {
     //
     // A single concatenated ScriptItem runs all scripts in written order within
     // one execution context, so the dependency chain holds. Joining with `;\n`
-    // prevents ASI/empty-statement hazards between script bodies. This mirrors
-    // Android's `inject_scripts_into_html`, which collapses all init scripts
-    // into one HTML document in order. (OHOS `ScriptItem` carries only `script`
-    // + `scriptRules` — `for_main_frame_only` is already dropped on this path —
-    // so a single blob loses no behavior OHOS currently honors.)
+    // prevents ASI/empty-statement hazards between script bodies. This is
+    // analogous to Android's `inject_scripts_into_html`, which puts all init
+    // scripts into one HTML document in order — but Android inserts one
+    // independent `<script>` element per script, so each parses and executes
+    // on its own. (OHOS `ScriptItem` carries only `script` + `scriptRules` —
+    // `for_main_frame_only` is already dropped on this path.) Unlike
+    // Android's per-script elements, this single blob is ONE parse/execute
+    // unit: a syntax error in any script prevents the whole unit from
+    // running (including the `__TAURI_INTERNALS__` bootstrap), and an
+    // uncaught runtime error aborts the remaining scripts — per-script
+    // error isolation is lost versus Android.
     let merged_scripts: Vec<WebviewInitializationScript> = if initialization_scripts.is_empty() {
       Vec::new()
     } else {
@@ -2017,11 +2041,15 @@ impl InnerWebView {
   pub fn zoom(&self, scale_factor: f64) -> Result<()> {
     // Absolute target, clamped to ArkWeb's effective window (webview2
     // `SetZoomFactor` parity: clamp instead of reject — upstream wry does
-    // not pre-validate the factor on other backends either). A
-    // non-positive / non-finite factor is NOT clamped: it passes through
-    // so the handle layer rejects it with its own logged error
-    // (plugin-webview's `set_zoom` is_finite precheck) instead of wry
-    // silently mapping garbage onto 1.0.
+    // not pre-validate the factor on other backends either). A non-finite
+    // factor (NaN / ±inf) is NOT clamped: it passes through so the handle
+    // layer rejects it with its own logged error (plugin-webview's
+    // `set_zoom` precheck is `is_finite`, which covers only NaN / ±inf)
+    // instead of wry silently mapping garbage onto 1.0. A 0.0 or negative
+    // FINITE factor is not rejected anywhere: the Rust precheck and the
+    // ArkTS `Number.isFinite` gate both let it through, and it reaches
+    // `WebviewController.zoom()` unmodified — there is no rejection for
+    // those values.
     //
     // ArkWeb's `WebviewController.zoom()` input semantics are NOT a clean
     // counterpart of wry's absolute contract — measured by driving the JS

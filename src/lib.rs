@@ -598,6 +598,11 @@ struct WebViewAttributes<'a> {
   /// - **Windows**:
   ///   - On Windows 7, transparency is not supported and the alpha value will be ignored.
   ///   - On Windows higher than 7: translucent colors are not supported so any alpha value other than `0` will be replaced by `255`
+  /// - **OpenHarmony**: the mutual exclusion above is reversed at the request
+  ///   layer — both values are always sent, and an explicitly set background
+  ///   color wins over `transparent = true` (the transparent fallback is
+  ///   dropped; deliberate, so a runtime `set_background_color` is not
+  ///   swallowed). The final render outcome is the engine's.
   pub background_color: Option<RGBA>,
 
   /// Whether load the provided URL to [`WebView`].
@@ -621,6 +626,12 @@ struct WebViewAttributes<'a> {
   ///   layer, which ArkWeb does not ship — so `true` never *creates* keyboard
   ///   zoom, it only stops the matcher from blocking. Pinch zoom is not
   ///   gated by this flag on OHOS at all.
+  ///
+  ///   The flag is sent for every created webview (never omitted), and the
+  ///   accelerator matcher keys on the whole window: a webview created later
+  ///   on the same window overwrites the window-level policy with its own
+  ///   flag (last-writer-wins), also changing whether the earlier webviews
+  ///   of that window still get Ctrl+/-/0.
   pub zoom_hotkeys_enabled: bool,
 
   /// Whether load the provided html string to [`WebView`].
@@ -673,6 +684,7 @@ struct WebViewAttributes<'a> {
   ///
   /// - macOS, iOS and Linux: `<scheme_name>://<path>` (so it will be `wry://path/to/page/`).
   /// - Windows and Android: `http://<scheme_name>.<path>` by default (so it will be `http://wry.path/to/page`). To use `https` instead of `http`, use [`WebViewBuilderExtWindows::with_https_scheme`] and [`WebViewBuilderExtAndroid::with_https_scheme`].
+  /// - OpenHarmony: `<scheme_name>://<host>/<path>` by default (so it will be `wry://localhost/path/to/page` — the host is always present). With [`WebViewBuilderExtOhos::with_https_scheme`] the same page instead reports `https://<scheme_name>.<host>/<path>`; CORS allowlists need to cover both forms.
   ///
   /// # Reading assets on mobile
   ///
@@ -693,6 +705,13 @@ struct WebViewAttributes<'a> {
   ///
   /// Note, that if you do block this behavior, it won't be possible to drop files on `<input type="file">` forms.
   /// Also note, that it's not possible to manually set the value of a `<input type="file">` via JavaScript for security reasons.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **OpenHarmony:** the `bool` return value of all four events is ignored,
+  ///   and `Enter`/`Over` never carry paths — only [`DragDropEvent::Drop`] does.
+  ///   See [`WebViewBuilder::with_drag_drop_handler`] for the full OHOS
+  ///   semantics.
   pub drag_drop_handler: Option<Box<dyn Fn(DragDropEvent) -> bool>>,
 
   /// A navigation handler to decide if incoming url is allowed to navigate.
@@ -756,6 +775,10 @@ struct WebViewAttributes<'a> {
   ///   but requires `devtools` feature flag to actually enable it in **release** builds.
   /// - Android: Open `chrome://inspect/#devices` in Chrome to get the devtools window. Wry's `WebView` devtools API isn't supported on Android.
   /// - iOS: Open Safari > Develop > [Your Device Name] > [Your WebView] to get the devtools window.
+  /// - **OpenHarmony**: debug-only semantics (same shape as macOS): the flag
+  ///   reaches the engine only in debug builds or with the `devtools` feature;
+  ///   otherwise nothing is sent at all (not even `false`), so enabling
+  ///   devtools in a release build is silently inert.
   pub devtools: bool,
 
   /// Whether clicking an inactive window also clicks through to the webview. Default is `false`.
@@ -772,7 +795,7 @@ struct WebViewAttributes<'a> {
   /// - Windows: Setting to `false` does nothing on WebView2 Runtime version before 92.0.902.0,
   ///   see <https://learn.microsoft.com/en-us/microsoft-edge/webview2/release-notes/archive?tabs=dotnetcsharp#10902-prerelease>
   ///
-  /// - **Android / iOS:** Unsupported.
+  /// - **Android / iOS / OpenHarmony:** Unsupported.
   pub back_forward_navigation_gestures: bool,
 
   /// Set a handler closure to process the change of the webview's document title.
@@ -787,6 +810,10 @@ struct WebViewAttributes<'a> {
   ///   see <https://learn.microsoft.com/en-us/microsoft-edge/webview2/release-notes/archive?tabs=dotnetcsharp#10121039>
   /// - **Android:** Unsupported yet.
   /// - **macOS / iOS**: Uses the nonPersistent DataStore.
+  /// - **OpenHarmony**: Supported — forwarded as `style.incognito` in the
+  ///   creation payload (`WebOptions.incognitoMode`), which also selects the
+  ///   private cookie store for the cookie APIs. Creation-time only: it
+  ///   cannot be toggled after the webview is built.
   pub incognito: bool,
 
   /// Whether all media can be played without user interaction.
@@ -798,14 +825,14 @@ struct WebViewAttributes<'a> {
   /// Set a proxy configuration for the webview. Supports HTTP CONNECT and SOCKSv5 proxies
   ///
   /// - **macOS**: Requires macOS 14.0+ and the `mac-proxy` feature flag to be enabled.
-  /// - **Android / iOS:** Not supported.
+  /// - **Android / iOS / OpenHarmony:** Not supported.
   pub proxy_config: Option<ProxyConfig>,
 
   /// Whether the webview should be focused when created.
   ///
   /// ## Platform-specific:
   ///
-  /// - **macOS / Android / iOS:** Unsupported.
+  /// - **macOS / Android / iOS / OpenHarmony:** Unsupported.
   pub focused: bool,
 
   /// The webview bounds. Defaults to `x: 0, y: 0, width: 200, height: 200`.
@@ -923,6 +950,13 @@ impl<'a> WebViewBuilder<'a> {
   }
 
   /// Create a new [`WebViewBuilder`] with a web context that can be shared with multiple [`WebView`]s.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony**: the [`WebContext`] is never consumed — the OHOS
+  ///   backend reads nothing from the context stored in the attributes, so
+  ///   the data-directory / shared-storage / automation-registration contract
+  ///   is silently inert there.
   pub fn new_with_web_context(web_context: &'a mut WebContext) -> Self {
     let attrs = WebViewAttributes {
       context: Some(web_context),
@@ -938,6 +972,17 @@ impl<'a> WebViewBuilder<'a> {
   }
 
   /// Set an id that will be passed when this webview makes requests in certain callbacks.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** the id is the primary key of every per-webview
+  ///   registry (the callbacks bundle, the JS-proxy declaration and the
+  ///   ArkTS-side entry map) and is not checked for uniqueness. A second
+  ///   webview created with an id already in use silently takes over: the
+  ///   new webview's registrations overwrite the old bundle, so the old
+  ///   webview's IPC messages and events are routed into the new webview's
+  ///   handlers, and disposing either one by id tears down the other's
+  ///   ArkTS entry. Always use a distinct id per webview.
   pub fn with_id(mut self, id: WebViewId<'a>) -> Self {
     self.attrs.id = Some(id);
     self
@@ -974,6 +1019,11 @@ impl<'a> WebViewBuilder<'a> {
   /// - **Windows**:
   ///   - on Windows 7, transparency is not supported and the alpha value will be ignored.
   ///   - on Windows higher than 7: translucent colors are not supported so any alpha value other than `0` will be replaced by `255`
+  /// - **OpenHarmony**: the mutual exclusion above is reversed at the request
+  ///   layer — both values are always sent, and an explicitly set background
+  ///   color wins over `transparent = true` (the transparent fallback is
+  ///   dropped; deliberate, so a runtime `set_background_color` is not
+  ///   swallowed). The final render outcome is the engine's.
   pub fn with_background_color(mut self, background_color: RGBA) -> Self {
     self.attrs.background_color = Some(background_color);
     self
@@ -1088,6 +1138,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - macOS, iOS and Linux: `<scheme_name>://<path>` (so it will be `wry://path/to/page).
   /// - Windows and Android: `http://<scheme_name>.<path>` by default (so it will be `http://wry.path/to/page`). To use `https` instead of `http`, use [`WebViewBuilderExtWindows::with_https_scheme`] and [`WebViewBuilderExtAndroid::with_https_scheme`].
+  /// - OpenHarmony: `<scheme_name>://<host>/<path>` by default (so it will be `wry://localhost/path/to/page` — the host is always present). With [`WebViewBuilderExtOhos::with_https_scheme`] the same page instead reports `https://<scheme_name>.<host>/<path>`; CORS allowlists need to cover both forms.
   ///
   /// # Reading assets on mobile
   ///
@@ -1149,6 +1200,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - macOS, iOS and Linux: `<scheme_name>://<path>` (so it will be `wry://path/to/page).
   /// - Windows and Android: `http://<scheme_name>.<path>` by default (so it will be `http://wry.path/to/page`). To use `https` instead of `http`, use [`WebViewBuilderExtWindows::with_https_scheme`] and [`WebViewBuilderExtAndroid::with_https_scheme`].
+  /// - OpenHarmony: `<scheme_name>://<host>/<path>` by default (so it will be `wry://localhost/path/to/page` — the host is always present). With [`WebViewBuilderExtOhos::with_https_scheme`] the same page instead reports `https://<scheme_name>.<host>/<path>`; CORS allowlists need to cover both forms.
   ///
   /// ## Platform-specific
   ///
@@ -1327,6 +1379,10 @@ impl<'a> WebViewBuilder<'a> {
   ///   but requires `devtools` feature flag to actually enable it in **release** builds.
   /// - Android: Open `chrome://inspect/#devices` in Chrome to get the devtools window. Wry's `WebView` devtools API isn't supported on Android.
   /// - iOS: Open Safari > Develop > [Your Device Name] > [Your WebView] to get the devtools window.
+  /// - **OpenHarmony**: debug-only semantics (same shape as macOS): the flag
+  ///   reaches the engine only in debug builds or with the `devtools` feature;
+  ///   otherwise nothing is sent at all (not even `false`), so enabling
+  ///   devtools in a release build is silently inert.
   pub fn with_devtools(mut self, devtools: bool) -> Self {
     self.attrs.devtools = devtools;
     self
@@ -1465,7 +1521,11 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - Windows: Requires WebView2 Runtime version 101.0.1210.39 or higher, does nothing on older versions,
   ///   see <https://learn.microsoft.com/en-us/microsoft-edge/webview2/release-notes/archive?tabs=dotnetcsharp#10121039>
-  /// - **Android / OpenHarmony:** Unsupported (silently ignored).
+  /// - **Android:** Unsupported yet.
+  /// - **OpenHarmony**: Supported — forwarded as `style.incognito` in the
+  ///   creation payload (`WebOptions.incognitoMode`), which also selects the
+  ///   private cookie store for the cookie APIs. Creation-time only, like
+  ///   macOS/iOS: it cannot be toggled after the webview is built.
   pub fn with_incognito(mut self, incognito: bool) -> Self {
     self.attrs.incognito = incognito;
     self
@@ -1566,10 +1626,22 @@ impl<'a> WebViewBuilder<'a> {
   /// - **Windows**: The webview will auto-resize when the passed handle is resized.
   /// - **Linux (X11)**: Unlike macOS and Windows, the webview will not auto-resize and you'll need to call [`WebView::set_bounds`] manually.
   ///
+  /// # Errors
+  ///
+  /// - Returns `Err(UnsupportedWindowHandle)` on Windows/macOS/Linux if the
+  ///   provided handle was not supported or invalid.
+  ///
   /// # Panics:
   ///
-  /// - Panics if the provided handle was not supported or invalid.
   /// - Panics on Linux, if [`gtk::init`] was not called in this thread.
+  ///
+  /// # Platform-specific:
+  ///
+  /// - **OpenHarmony**: the provided handle is neither read nor validated —
+  ///   an unsupported or invalid handle never causes an error here, let
+  ///   alone a panic. The window the webview lands on is decided by
+  ///   [`WebViewBuilderExtOhos::with_window_id`] and the bridge runtime, not
+  ///   by the passed handle.
   pub fn build<W: HasWindowHandle>(self, window: &'a W) -> Result<WebView> {
     self.error?;
 
@@ -1594,10 +1666,21 @@ impl<'a> WebViewBuilder<'a> {
   ///   we recommend using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
   /// - **Android/iOS:** Unsupported.
   ///
+  /// # Errors
+  ///
+  /// - Returns `Err(UnsupportedWindowHandle)` on Windows/macOS/Linux if the
+  ///   provided handle was not supported or invalid.
+  ///
   /// # Panics:
   ///
-  /// - Panics if the provided handle was not support or invalid.
   /// - Panics on Linux, if [`gtk::init`] was not called in this thread.
+  ///
+  /// # Platform-specific
+  ///
+  /// - **OpenHarmony**: same as [`WebViewBuilder::build`] — the provided
+  ///   handle is neither read nor validated; the window the webview lands on
+  ///   is decided by [`WebViewBuilderExtOhos::with_window_id`] and the bridge
+  ///   runtime.
   pub fn build_as_child<W: HasWindowHandle>(self, window: &'a W) -> Result<WebView> {
     self.error?;
 
@@ -2242,6 +2325,14 @@ impl WebView {
   /// serialized into a JSON string and passed to the callback function.
   ///
   /// Exception is ignored because of the limitation on windows. You can catch it yourself and return as string as a workaround.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony**: a script that produces no value (`undefined`) reaches
+  ///   the callback as an **empty string**, which is not a JSON serialization
+  ///   product (a thrown JS exception still arrives as the literal `"null"`).
+  ///   Missing-value detection written against WebView2's `"null"` will
+  ///   misfire here.
   pub fn evaluate_script_with_callback(
     &self,
     js: &str,
@@ -2251,6 +2342,17 @@ impl WebView {
   }
 
   /// Launch print modal for the webview content.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony**: returns `Err` until the first page load has finished —
+  ///   a state gate no other backend has (webview2 evaluates `window.print()`,
+  ///   webkitgtk always returns `Ok`, wkwebview runs a print operation). The
+  ///   error text names ArkTS's "onPageEnd"; the Rust-level equivalent is
+  ///   [`PageLoadEvent::Finished`] delivered to
+  ///   [`WebViewBuilder::with_on_page_load_handler`]. After the initial `Ok`,
+  ///   later failures (including a denied print permission) are only logged
+  ///   and cannot be observed from the return value.
   pub fn print(&self) -> Result<()> {
     self.webview.print()
   }
@@ -2304,6 +2406,12 @@ impl WebView {
   /// ## Platform-specific
   ///
   /// - **Android / iOS:** Not supported.
+  /// - **OpenHarmony**: a call issued before the create handshake completes is
+  ///   queued and replayed afterwards. Combined with
+  ///   [`WebView::close_devtools`] this is asymmetric: a queued `open` wins
+  ///   over an earlier `close`, so the inspector may end up open even though
+  ///   the last API call was `close_devtools` — call `close_devtools` again
+  ///   once the handshake has completed.
   #[cfg(any(debug_assertions, feature = "devtools"))]
   pub fn open_devtools(&self) {
     self.webview.open_devtools()
@@ -2314,6 +2422,12 @@ impl WebView {
   /// ## Platform-specific
   ///
   /// - **Windows / Android / iOS:** Not supported.
+  /// - **OpenHarmony**: a call issued before the create handshake completes
+  ///   only records the close intent — the queued replay of an earlier
+  ///   [`WebView::open_devtools`] still wins. After the handshake, if the
+  ///   bridge call fails, the open-state flag has already been flipped to
+  ///   `false`, so [`WebView::is_devtools_open`] can disagree with the real
+  ///   engine state.
   #[cfg(any(debug_assertions, feature = "devtools"))]
   pub fn close_devtools(&self) {
     self.webview.close_devtools()
@@ -2336,6 +2450,14 @@ impl WebView {
   /// - **Android**: Not supported.
   /// - **macOS**: available on macOS 11+ only.
   /// - **iOS**: available on iOS 14+ only.
+  /// - **OpenHarmony**: the only backend that rewrites the caller's input at
+  ///   this entry: the factor is silently clamped to ArkWeb's effective
+  ///   window `[1.0, 4.0]` before dispatch (webview2/webkitgtk/wkwebview
+  ///   forward it as-is), so zooming below 1.0 is impossible and the applied
+  ///   outcome is not observable from the return value — only a debug-level
+  ///   scale-change log. `NaN`/±inf pass through unclamped and are rejected
+  ///   by the handle layer; a `0.0` or negative finite factor also passes
+  ///   through unclamped (no rejection anywhere).
   pub fn zoom(&self, scale_factor: f64) -> Result<()> {
     self.webview.zoom(scale_factor)
   }
@@ -2824,6 +2946,10 @@ pub trait WebViewExtOhos {
   /// (8.27x11.69in, zero margins, shouldPrintBackground=true).
   ///
   /// `callback` receives `true` when the PDF was written to `path`.
+  ///
+  /// Returns `Err` until the first page load has finished (the same
+  /// `page_loaded` gate as [`WebView::print`]); the error text names ArkTS's
+  /// "onPageEnd", whose Rust-level equivalent is [`PageLoadEvent::Finished`].
   fn create_pdf(
     &self,
     path: &str,
