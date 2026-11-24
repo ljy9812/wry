@@ -518,6 +518,61 @@ enum PendingOp {
   SetDevtools(Arc<AtomicBool>),
 }
 
+/// Review #41: settle window for the orphaned print-temp sweep below, in
+/// seconds past the create-pdf failure. The ArkTS `create-pdf` operation is
+/// NOT cancelled by the bridge timeout (JS has no cooperative cancellation),
+/// and its `openSync(CREATE|TRUNC)` RE-CREATES the file after an immediate
+/// delete — so the sweep must wait for the in-flight write to settle. The
+/// bridge's own 15s default timeout has already elapsed when this runs;
+/// 120s on top of that leaves a generous margin for the still-running ArkTS
+/// write before the sweep.
+const PRINT_TEMP_CLEANUP_DELAY_SECS: u64 = 120;
+
+/// Review #41: best-effort delayed sweep for the `wry_print_*.pdf` temp file
+/// of a FAILED `create-pdf` step. The ArkTS-side `unlinkSync` lives only in
+/// `printPdf`'s cleanup, and `printPdf` is only reached by the "print" action
+/// — which the failed-create-pdf arm skips — so without this sweep a
+/// create_pdf failure (including the bridge's 15s timeout) leaves the temp
+/// file in the sandbox forever: the ArkTS op is not cancelled by the timeout
+/// and still writes the file afterwards, with nobody left to delete it.
+///
+/// Race constraint (disclosed): because that late ArkTS write RE-CREATES the
+/// file after any earlier delete, an immediate sweep would be undone — hence
+/// the delayed sweep ([`PRINT_TEMP_CLEANUP_DELAY_SECS`]). A pathologically
+/// slow ArkTS write that settles AFTER the sweep can still recreate the file
+/// and leak it; that residual window is accepted rather than guarded (a
+/// callback-chained cleanup would need a new bridge API). The sweep is
+/// best-effort: NotFound is success, any other removal error is logged at
+/// debug level only.
+fn schedule_print_temp_cleanup(path: &str) {
+  let path = path.to_string();
+  let spawned = std::thread::Builder::new()
+    .name("wry-print-temp-cleanup".into())
+    .spawn(move || {
+      std::thread::sleep(std::time::Duration::from_secs(
+        PRINT_TEMP_CLEANUP_DELAY_SECS,
+      ));
+      match std::fs::remove_file(&path) {
+        Ok(()) => {
+          log::debug!("[wry] removed orphaned print temp file: {}", path);
+        }
+        // The ArkTS op failed without writing anything (or another sweep got
+        // there first) — nothing to clean.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+          log::debug!(
+            "[wry] failed to remove orphaned print temp file '{}': {}",
+            path,
+            e
+          );
+        }
+      }
+    });
+  if let Err(e) = spawned {
+    log::warn!("[wry] could not spawn the print temp cleanup sweep: {}", e);
+  }
+}
+
 impl PendingOp {
   async fn execute(self, handle: &WebviewHandle) {
     match self {
@@ -585,7 +640,17 @@ impl PendingOp {
       PendingOp::Print(path) => {
         if let Err(e) = handle.create_pdf(&path, None).await {
           log::warn!("[wry] pending create_pdf failed: {}", e);
+          // Review #41: the failed create-pdf arm skips `print`, which is the
+          // only path that schedules the ArkTS-side temp-file cleanup — and
+          // the ArkTS create-pdf op keeps running past this failure (bridge
+          // timeouts do not cancel it) and still writes the file. Schedule
+          // the delayed best-effort sweep so the temp file does not stay in
+          // the sandbox forever.
+          schedule_print_temp_cleanup(&path);
         } else if let Err(e) = handle.print(&path).await {
+          // ArkTS `printPdf` owns the temp-file cleanup on this arm (its
+          // body runs the unlinkSync whether the print itself succeeds or
+          // fails), so no wry-side sweep is needed here.
           log::warn!("[wry] pending print failed: {}", e);
         }
       }
@@ -759,6 +824,16 @@ pub(crate) struct InnerWebView {
   // and child webviews ([`InnerWebView::dispose_child`]); child-only behavior
   // that remains (initial bounds conversion) uses the `new_inner` parameter.
   disposed: AtomicBool,
+  /// Review #21: the create-path https-rewrite inputs captured at build time
+  /// (empty unless `use_https` was on AND custom protocols were registered —
+  /// exactly the create-path gate). Runtime navigations
+  /// ([`InnerWebView::load_url`] / [`InnerWebView::load_url_with_headers`])
+  /// run the same rewrite through these names, so a runtime navigation of a
+  /// `<protocol>://` URL lands on the same rewritten
+  /// `https://<protocol>.localhost` origin the initial load used instead of
+  /// splitting the two loads across origins (localStorage /
+  /// secure-context divergence).
+  https_rewrite_protocols: Vec<String>,
 }
 
 /// m5: failed-create cleanup -- a queued `SetDevtools` can never replay once
@@ -792,6 +867,31 @@ fn failed_create_cleanup(guard: &mut Vec<PendingOp>) {
   }
   // Queued ops can never execute -- drop them.
   guard.clear();
+}
+
+/// Review #2: rollback for the SYNCHRONOUS early-exit arms of
+/// [`InnerWebView::new_inner`] — the `?` sites that sit after
+/// `callbacks_builder.build()` (the callbacks bundle is already registered)
+/// but before the async `create` is spawned, so the create-Err arm's
+/// `rollback_registrations` (which owns cleanup for everything registered on
+/// this attempt) can never run for them. Without this, a failure at any of
+/// those sites leaks the registered callbacks bundle (including captured
+/// handlers), the queued js-proxy declaration, and any per-webview scheme
+/// bindings that were already installed — until process end.
+///
+/// Same semantics as the async create-Err arm: per-webview registry entries
+/// are removed, process-wide scheme declarations are intentionally kept
+/// (shared across webviews, idempotent). `stage` is failure-site context for
+/// the log line only.
+fn rollback_sync_registrations(client: &WebviewClient, id: &str, stage: &str) {
+  if let Err(rollback_err) = client.rollback_registrations(id) {
+    log::warn!(
+      "[wry] rollback of registry entries after '{}' failure for '{}' failed: {}",
+      stage,
+      id,
+      rollback_err
+    );
+  }
 }
 
 /// PR review fix W1: the pre-handshake open queue attempt, factored out of
@@ -1060,7 +1160,8 @@ impl InnerWebView {
     callbacks_builder = callbacks_builder.on_scale_change(|event| {
       log::debug!(
         "[wry] webview zoom scale: {} -> {}",
-        event.old_scale, event.new_scale
+        event.old_scale,
+        event.new_scale
       );
     });
 
@@ -1185,6 +1286,16 @@ impl InnerWebView {
       .map(|(k, v)| (k, Arc::new(SendSyncBox(v))))
       .collect();
     let shared_for_intercept = shared_protocols.clone();
+    // Review #21: capture the create-path https-rewrite gate + protocol names
+    // so the runtime navigation methods can apply the same rewrite. Empty
+    // unless `use_https` is on AND protocols are registered — the exact
+    // create-path gate — making the runtime rewrite a no-op in every other
+    // configuration.
+    let https_rewrite_protocols: Vec<String> = if use_https {
+      shared_for_intercept.keys().cloned().collect()
+    } else {
+      Vec::new()
+    };
 
     // #199: pre-fill the URL cache with the (normalized) initial URL so the
     // first IPC invoke that arrives before navigation completes resolves
@@ -1244,9 +1355,11 @@ impl InnerWebView {
           (handler.0)(request);
         })
         .build()
-        .map_err(|e| {
-          Error::OpenHarmonyWebviewError(format!("Failed to register IPC proxy: {}", e))
-        })?;
+        .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to register IPC proxy: {}", e)))
+        // Review #2: the callbacks bundle is already registered at this
+        // point and the async create (with its Err-arm rollback) was never
+        // spawned — roll the attempt's entries back before bailing out.
+        .inspect_err(|_| rollback_sync_registrations(&client, &id, "IPC proxy registration"))?;
     }
 
     // 4. Register custom protocols (before create)
@@ -1269,12 +1382,19 @@ impl InnerWebView {
       | WebviewProtocolOptions::FetchEnabled
       | WebviewProtocolOptions::CodeCacheEnabled;
     for protocol in shared_protocols.keys() {
-      WebviewProtocol::register(protocol, protocol_options).map_err(|e| {
-        Error::OpenHarmonyInitError(format!(
-          "Failed to declare custom protocol '{}': {}",
-          protocol, e
-        ))
-      })?;
+      WebviewProtocol::register(protocol, protocol_options)
+        .map_err(|e| {
+          Error::OpenHarmonyInitError(format!(
+            "Failed to declare custom protocol '{}': {}",
+            protocol, e
+          ))
+        })
+        // Review #2: same sync-early-exit shape — the callbacks bundle (and
+        // possibly the IPC proxy) is already registered, the async create was
+        // never spawned.
+        .inspect_err(|_| {
+          rollback_sync_registrations(&client, &id, "custom protocol declaration")
+        })?;
     }
 
     for (protocol, callback) in &shared_protocols {
@@ -1301,7 +1421,12 @@ impl InnerWebView {
         )
         .map_err(|e| {
           Error::OpenHarmonyInitError(format!("Failed to register custom protocol: {}", e))
-        })?;
+        })
+        // Review #2: mid-loop failure — earlier schemes' per-webview bindings
+        // are already installed; roll the attempt's entries back (the bridge
+        // `WebviewProtocol::register` declarations are process-global and
+        // stay, matching the async create-Err arm).
+        .inspect_err(|_| rollback_sync_registrations(&client, &id, "custom protocol binding"))?;
     }
 
     // 5. Build create request
@@ -1635,6 +1760,7 @@ impl InnerWebView {
       devtools_open,
       incognito,
       disposed: AtomicBool::new(false),
+      https_rewrite_protocols,
     })
   }
 
@@ -1657,6 +1783,31 @@ impl InnerWebView {
   /// Get the handle if ready, or None if create is still pending.
   fn try_handle(&self) -> Option<WebviewHandle> {
     self.handle.get().cloned()
+  }
+
+  /// Review #21: the runtime-navigation twin of the create-path https
+  /// rewrite (`new_inner` step 5). When this webview was built with
+  /// `use_https` and custom protocols, a `<protocol>://` navigation is
+  /// rewritten to its `https://<protocol>.localhost/...` form so the runtime
+  /// navigation lands on the SAME origin the initial (rewritten) load used.
+  /// Without this, `use_https` apps run their initial load on the rewritten
+  /// https origin while every runtime `load_url` (e.g. tauri's Navigate,
+  /// which hands over the native `tauri://localhost` form) lands on the raw
+  /// scheme origin — a two-origin split (localStorage / secure context).
+  fn rewrite_runtime_url(&self, url: &str) -> String {
+    if self.https_rewrite_protocols.is_empty() {
+      return url.to_string();
+    }
+    let rewritten = rewrite_https_url_for_protocols(url, &self.https_rewrite_protocols);
+    if rewritten != url {
+      log::info!(
+        "[wry https-intercept] runtime URL rewrite: {} → {} (protocols={:?})",
+        url,
+        rewritten,
+        self.https_rewrite_protocols
+      );
+    }
+    rewritten
   }
 
   // ─── Public API methods ─────────────────────────────────────────────────────
@@ -1904,7 +2055,10 @@ impl InnerWebView {
         }
       }
     };
-    let value = format_set_cookie_value(cookie);
+    // Review #33: the serialization validates each field (see
+    // `format_set_cookie_value`) — an injectable value fails HERE, before
+    // anything is dispatched.
+    let value = format_set_cookie_value(cookie)?;
     self.dispatch_or_queue(PendingOp::SetCookie(url, value))?;
     Ok(())
   }
@@ -1985,13 +2139,19 @@ impl InnerWebView {
   }
 
   pub fn load_url(&self, url: &str) -> Result<()> {
-    self.dispatch_or_queue(PendingOp::LoadUrl(url.to_string()))?;
+    // Review #21: same https rewrite as the create path (see
+    // [`Self::rewrite_runtime_url`]).
+    let url = self.rewrite_runtime_url(url);
+    self.dispatch_or_queue(PendingOp::LoadUrl(url))?;
     Ok(())
   }
 
   pub fn load_url_with_headers(&self, url: &str, headers: http::HeaderMap) -> Result<()> {
     let header_map = headers_to_btree(&headers);
-    self.dispatch_or_queue(PendingOp::LoadUrlWithHeaders(url.to_string(), header_map))?;
+    // Review #21: same https rewrite as `load_url` — this is the same
+    // navigation family and would otherwise split origins identically.
+    let url = self.rewrite_runtime_url(url);
+    self.dispatch_or_queue(PendingOp::LoadUrlWithHeaders(url, header_map))?;
     Ok(())
   }
 
@@ -2136,8 +2296,18 @@ impl InnerWebView {
   }
 
   pub fn focus_parent(&self) -> Result<()> {
-    // OHOS has no separate parent window for the webview
-    self.dispatch_or_queue(PendingOp::Focus)?;
+    // Review #1 (semantic inversion): this used to dispatch the SAME
+    // `PendingOp::Focus` op as [`Self::focus`]. The sibling backends move
+    // focus AWAY from the webview here (webview2 `SetFocus(Some(parent))`,
+    // gtk `window.focus`), so a caller invoking this to take the keyboard
+    // back was instead handing focus TO the webview. The OHOS bridge has no
+    // reverse op -- the only focus action is `requestFocus` on the webview
+    // controller; there is no blur and no parent-window focus -- so the only
+    // correct implementation is a documented no-op (same shape as Android's
+    // unimplemented `focus_parent` and this backend's `delete_cookie`):
+    // doing nothing leaves focus where it is instead of inverting the
+    // caller's intent.
+    log::warn!("[wry] focus_parent is a no-op on OHOS: the bridge exposes no blur/parent-focus op");
     Ok(())
   }
 
@@ -2464,18 +2634,29 @@ fn custom_protocols_use_https(protocols: &HashMap<String, SharedProtocolHandler>
 }
 
 /// Rewrite `<protocol>://localhost/<path>` to `https://<protocol>.localhost/<path>`
-/// when the URL's scheme matches one of `custom_protocols`' keys.
-fn rewrite_https_url_if_matching(
+/// when the URL's scheme matches one of `protocols`. Review #21: shared by
+/// the create-time rewrite and the runtime `load_url` / `load_url_with_headers`
+/// rewrite, so both navigation entry points land on the same origin.
+fn rewrite_https_url_for_protocols<'a>(
   url: &str,
-  custom_protocols: &HashMap<String, SharedProtocolHandler>,
+  protocols: impl IntoIterator<Item = &'a String>,
 ) -> String {
-  for protocol in custom_protocols.keys() {
+  for protocol in protocols {
     let original_prefix = format!("{}://", protocol);
     if url.starts_with(&original_prefix) {
       return custom_protocol_workaround::apply_uri_work_around(url, "https", protocol);
     }
   }
   url.to_string()
+}
+
+/// Rewrite `<protocol>://localhost/<path>` to `https://<protocol>.localhost/<path>`
+/// when the URL's scheme matches one of `custom_protocols`' keys.
+fn rewrite_https_url_if_matching(
+  url: &str,
+  custom_protocols: &HashMap<String, SharedProtocolHandler>,
+) -> String {
+  rewrite_https_url_for_protocols(url, custom_protocols.keys())
 }
 
 /// Formats an RGBA color as the ArkWeb `#AARRGGBB` string (alpha first).
@@ -2517,13 +2698,92 @@ fn format_imf_fixdate(dt: cookie::time::OffsetDateTime) -> String {
   )
 }
 
+/// R4 review #33: the characters that break the Set-Cookie wire syntax —
+/// CTLs and the `;` attribute separator. A `"; "` inside a field lets the
+/// remainder be re-parsed as attribute syntax (`; Domain=`/`; Secure`
+/// injection); CTLs are the classic smuggle class. Every other character
+/// (space/comma/non-ASCII) passes through unchanged, preserving the pre-fix
+/// behavior for those values.
+fn has_cookie_syntax_breakers(s: &str) -> bool {
+  s.bytes().any(|b| b < 0x20 || b == 0x7F || b == b';')
+}
+
+/// R4 review #33: RFC 6265 section 4.1.1 `token` (via RFC 2616 `tchar`) — the
+/// allowed characters for a cookie-name. A name outside this set cannot even
+/// form a well-formed `name=value` pair on the wire.
+fn is_rfc6265_cookie_name(name: &str) -> bool {
+  !name.is_empty()
+    && name.bytes().all(|b| {
+      b.is_ascii_alphanumeric()
+        || matches!(
+          b,
+          b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+        )
+    })
+}
+
 /// Format a `cookie::Cookie` as a Set-Cookie value string (RFC 6265).
-fn format_set_cookie_value(cookie: &Cookie<'_>) -> String {
-  let mut value = format!("{}={}", cookie.name(), cookie.value());
+///
+/// R4 review #33: the OHOS bridge carries the cookie as a single string
+/// (`configCookieSync(url, value, incognito)`), so this serialization is part
+/// of the trust boundary — unlike the sibling backends, which hand the engine
+/// a structured cookie object parsed field-by-field. An unescaped `"; "` in
+/// the value terminates the pair there and lets the rest be re-parsed as
+/// attribute syntax. Instead of escaping (which would silently change the
+/// value the page sees), every free-form field is validated against the
+/// syntax it is serialized into and a cookie that cannot be serialized safely
+/// is REFUSED with an `Err` — the engine-side rejection the sibling backends
+/// get for free. Validation policy:
+/// - `name` must be an RFC 6265 `token` (it is the pair's structure itself);
+/// - `value`/`Domain`/`Path` must not contain `;` or CTLs;
+/// - the remaining attributes (`Expires`/`Max-Age`/`SameSite`/flags) are
+///   generated from typed sources and cannot carry attacker syntax.
+fn format_set_cookie_value(cookie: &Cookie<'_>) -> Result<String> {
+  let name = cookie.name();
+  if !is_rfc6265_cookie_name(name) {
+    return Err(Error::OpenHarmonyWebviewError(format!(
+      "set_cookie: refusing cookie with invalid name {:?} (must be a non-empty RFC 6265 token)",
+      name
+    )));
+  }
+  let value = cookie.value();
+  if has_cookie_syntax_breakers(value) {
+    return Err(Error::OpenHarmonyWebviewError(format!(
+      "set_cookie: refusing cookie '{}': value contains ';' or a control character, which would be re-parsed as Set-Cookie attribute syntax",
+      name
+    )));
+  }
+  let mut value = format!("{}={}", name, value);
   if let Some(d) = cookie.domain() {
+    if has_cookie_syntax_breakers(d) {
+      return Err(Error::OpenHarmonyWebviewError(format!(
+        "set_cookie: refusing cookie '{}': Domain contains ';' or a control character",
+        name
+      )));
+    }
     value.push_str(&format!("; Domain={}", d));
   }
   if let Some(p) = cookie.path() {
+    if has_cookie_syntax_breakers(p) {
+      return Err(Error::OpenHarmonyWebviewError(format!(
+        "set_cookie: refusing cookie '{}': Path contains ';' or a control character",
+        name
+      )));
+    }
     value.push_str(&format!("; Path={}", p));
   }
   // Persistence attributes (#190(1)): emit Expires (IMF-fixdate) and Max-Age so
@@ -2545,7 +2805,7 @@ fn format_set_cookie_value(cookie: &Cookie<'_>) -> String {
   if let Some(same_site) = cookie.same_site() {
     value.push_str(&format!("; SameSite={}", same_site));
   }
-  value
+  Ok(value)
 }
 
 /// Resolves the eval-callback payload for an evaluation outcome (#194).
@@ -2625,7 +2885,7 @@ mod tests {
       .http_only(true)
       .same_site(SameSite::Lax)
       .build();
-    let v = format_set_cookie_value(&cookie);
+    let v = format_set_cookie_value(&cookie).unwrap();
     assert!(v.starts_with("token=abc"));
     assert!(v.contains("; Domain=example.com"));
     assert!(v.contains("; Path=/"));
@@ -2637,7 +2897,67 @@ mod tests {
   #[test]
   fn format_set_cookie_value_minimal() {
     let cookie = Cookie::build(("k", "v")).build();
-    assert_eq!(format_set_cookie_value(&cookie), "k=v");
+    assert_eq!(format_set_cookie_value(&cookie).unwrap(), "k=v");
+  }
+
+  // Review #33: the Set-Cookie string is the trust boundary on OHOS (the
+  // bridge delivers it verbatim to ArkTS `configCookieSync`), so values that
+  // carry attribute syntax must be REFUSED, not serialized.
+
+  /// UT for review #33: a value smuggling Set-Cookie attribute syntax
+  /// (`; Domain=`/`; Secure`) is refused — the pre-fix formatter would have
+  /// emitted `k=v; Domain=evil.com; Secure`, re-parsed by the engine as
+  /// attributes.
+  /// # Brief: build a cookie whose value contains `; Domain=evil.com; Secure`
+  /// and assert the formatter errors instead of returning an injectable string.
+  #[test]
+  fn ut_format_set_cookie_value_refuses_attribute_injection() {
+    let cookie = Cookie::build(("k", "v; Domain=evil.com; Secure")).build();
+    assert!(format_set_cookie_value(&cookie).is_err());
+  }
+
+  /// UT for review #33: a value carrying control characters (header/CTL
+  /// smuggle class) is refused.
+  /// # Brief: build a cookie whose value contains CRLF and assert an Err.
+  #[test]
+  fn ut_format_set_cookie_value_refuses_control_characters() {
+    let cookie = Cookie::build(("k", "v\r\nX-Injected: 1")).build();
+    assert!(format_set_cookie_value(&cookie).is_err());
+  }
+
+  /// UT for review #33: a non-token name cannot form a well-formed
+  /// `name=value` pair and is refused (empty name too).
+  /// # Brief: names with a space, with `=`, and the empty name all error.
+  #[test]
+  fn ut_format_set_cookie_value_refuses_invalid_name() {
+    let cookie = Cookie::build(("bad name", "v")).build();
+    assert!(format_set_cookie_value(&cookie).is_err());
+    let cookie = Cookie::build(("a=b", "v")).build();
+    assert!(format_set_cookie_value(&cookie).is_err());
+    let cookie = Cookie::build(("", "v")).build();
+    assert!(format_set_cookie_value(&cookie).is_err());
+  }
+
+  /// UT for review #33: a `;` inside the Domain attribute is refused —
+  /// cookie 0.18.2 stores domains verbatim (`set_domain` has no validation),
+  /// so `Domain=example.com; Path=/admin` would have been emitted verbatim.
+  /// # Brief: build a cookie whose domain carries a `;`-suffix and assert Err.
+  #[test]
+  fn ut_format_set_cookie_value_refuses_injected_domain() {
+    let cookie = Cookie::build(("k", "v"))
+      .domain("example.com; Path=/admin")
+      .build();
+    assert!(format_set_cookie_value(&cookie).is_err());
+  }
+
+  /// UT for review #33: the refusal policy is minimal — space/comma/colon and
+  /// non-ASCII values are NOT cookie-octets but do not carry attribute
+  /// syntax, so they keep flowing unchanged (no regression for pre-fix apps).
+  /// # Brief: assert a mixed benign value round-trips verbatim.
+  #[test]
+  fn ut_format_set_cookie_value_allows_space_comma_and_non_ascii_values() {
+    let cookie = Cookie::build(("k", "a b,c:dé")).build();
+    assert_eq!(format_set_cookie_value(&cookie).unwrap(), "k=a b,c:dé");
   }
 
   // #190(1): persistence attributes survive the Set-Cookie formatting so a
@@ -2654,7 +2974,7 @@ mod tests {
       cookie::time::Time::MIDNIGHT,
     );
     let cookie = Cookie::build(("token", "abc")).expires(dt).build();
-    let v = format_set_cookie_value(&cookie);
+    let v = format_set_cookie_value(&cookie).unwrap();
     assert!(
       v.contains("; Expires=Thu, 01 Jan 2026 00:00:00 GMT"),
       "IMF-fixdate Expires missing or malformed: {v}"
@@ -2668,7 +2988,7 @@ mod tests {
     let cookie = Cookie::build(("k", "v"))
       .max_age(cookie::time::Duration::seconds(3600))
       .build();
-    let v = format_set_cookie_value(&cookie);
+    let v = format_set_cookie_value(&cookie).unwrap();
     assert!(v.contains("; Max-Age=3600"), "Max-Age missing: {v}");
     // Expiration came only from max_age -- no `Expires` must be invented.
     assert!(!v.contains("Expires="), "unexpected Expires: {v}");
@@ -2679,7 +2999,7 @@ mod tests {
   #[test]
   fn ut_format_set_cookie_value_session_omits_both_attributes() {
     let cookie = Cookie::build(("k", "v")).build();
-    let v = format_set_cookie_value(&cookie);
+    let v = format_set_cookie_value(&cookie).unwrap();
     assert!(
       !v.contains("Expires="),
       "session cookie gained Expires: {v}"
@@ -2703,7 +3023,7 @@ mod tests {
       .expires(dt)
       .max_age(cookie::time::Duration::seconds(60))
       .build();
-    let v = format_set_cookie_value(&cookie);
+    let v = format_set_cookie_value(&cookie).unwrap();
     assert!(
       v.contains("; Expires=Thu, 01 Jan 2026 00:00:00 GMT"),
       "Expires missing: {v}"
@@ -2943,7 +3263,7 @@ mod tests {
   #[test]
   fn format_set_cookie_value_with_path_only() {
     let cookie = Cookie::build(("session", "xyz")).path("/app").build();
-    let v = format_set_cookie_value(&cookie);
+    let v = format_set_cookie_value(&cookie).unwrap();
     assert!(v.starts_with("session=xyz"));
     assert!(v.contains("; Path=/app"));
     assert!(!v.contains("; Secure"));
@@ -2955,7 +3275,7 @@ mod tests {
     let cookie = Cookie::build(("token", "abc"))
       .same_site(SameSite::Strict)
       .build();
-    let v = format_set_cookie_value(&cookie);
+    let v = format_set_cookie_value(&cookie).unwrap();
     assert!(v.contains("; SameSite=Strict"));
   }
 
@@ -2964,7 +3284,7 @@ mod tests {
     let cookie = Cookie::build(("token", "abc"))
       .same_site(SameSite::None)
       .build();
-    let v = format_set_cookie_value(&cookie);
+    let v = format_set_cookie_value(&cookie).unwrap();
     assert!(v.contains("; SameSite=None"));
   }
 

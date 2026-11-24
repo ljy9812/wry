@@ -2490,6 +2490,9 @@ impl WebView {
   /// ## Platform-specific:
   ///
   /// - **Android**: Not implemented.
+  /// - **OpenHarmony**: Not implemented (the bridge exposes no
+  ///   blur/parent-focus op). The call is a no-op that leaves focus where it
+  ///   is -- it does NOT focus the webview.
   pub fn focus_parent(&self) -> Result<()> {
     self.webview.focus_parent()
   }
