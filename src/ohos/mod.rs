@@ -646,13 +646,16 @@ impl PendingOp {
       PendingOp::Zoom { target } => {
         if let Err(e) = handle.set_zoom(target).await {
           log::warn!("[wry] pending set_zoom failed: {}", e);
-          // A failure here means the target never reached ArkWeb — a
-          // transport/instance error (ArkWeb itself never rejects a zoom
-          // call; out-of-range factors were already clamped to [1.0, 4.0]
-          // at the `zoom` entry, so this arm only ever sees a target within
-          // that window — no clamping happens here). Nothing was
-          // optimistically advanced (absolute-target sending keeps no
-          // model), so there is nothing to roll back.
+          // ArkWeb *can* reject a zoom call: the Web component's zoomAccess
+          // switch gates WebviewController.zoom() as well as gesture zoom,
+          // and a false value surfaces here as "Function not enabled"
+          // (1125 regression — zoomAccess was wrongly tied to
+          // zoom_hotkeys_enabled; the plugin now sets zoomAccess(true) at
+          // webview build). Out-of-range factors were already clamped to
+          // [1.0, 4.0] at the `zoom` entry, so this arm otherwise only sees
+          // a target within that window. Nothing was optimistically advanced
+          // (absolute-target sending keeps no model), so there is nothing
+          // to roll back.
         }
       }
       PendingOp::SetBackgroundColor(color) => {
