@@ -2453,8 +2453,14 @@ impl WebView {
   /// - **OpenHarmony**: the only backend that rewrites the caller's input at
   ///   this entry: the factor is silently clamped to ArkWeb's effective
   ///   window `[1.0, 4.0]` before dispatch (webview2/webkitgtk/wkwebview
-  ///   forward it as-is), so zooming below 1.0 is impossible and the applied
-  ///   outcome is not observable from the return value — only a debug-level
+  ///   forward it as-is), so zooming below 1.0 is impossible. The applied
+  ///   semantics is MULTIPLICATIVE (device-measured): the factor scales the
+  ///   current zoom, ×1 is an identity — so from a clean page the call lands
+  ///   on the clamped factor (absolute-looking), but once the current zoom
+  ///   differs (pinch, an earlier call) the factor compounds and NO input
+  ///   restores 1.0 or zooms out (every clamped input is ≥ 1.0); recovery is
+  ///   only reachable through native pinch gestures. The applied outcome is
+  ///   not observable from the return value — only a debug-level
   ///   scale-change log. `NaN`/±inf pass through unclamped and are rejected
   ///   by the handle layer; a `0.0` or negative finite factor also passes
   ///   through unclamped (no rejection anywhere).

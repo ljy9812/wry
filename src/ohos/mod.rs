@@ -651,11 +651,13 @@ impl PendingOp {
           // and a false value surfaces here as "Function not enabled"
           // (1125 regression — zoomAccess was wrongly tied to
           // zoom_hotkeys_enabled; the plugin now sets zoomAccess(true) at
-          // webview build). Out-of-range factors were already clamped to
-          // [1.0, 4.0] at the `zoom` entry, so this arm otherwise only sees
-          // a target within that window. Nothing was optimistically advanced
-          // (absolute-target sending keeps no model), so there is nothing
-          // to roll back.
+          // webview build). Only positive finite factors were pre-clamped to
+          // [1.0, 4.0] at the `zoom` entry (see `clamp_zoom_target`): 0.0 and
+          // negative finite factors BYPASS the clamp and reach ArkWeb
+          // verbatim, and NaN / ±inf are rejected by the handle layer's
+          // `is_finite` precheck — surfacing HERE as the Err arm. Nothing
+          // was optimistically advanced (absolute-target sending keeps no
+          // model), so there is nothing to roll back.
         }
       }
       PendingOp::SetBackgroundColor(color) => {
@@ -2188,22 +2190,25 @@ impl InnerWebView {
     // `WebviewController.zoom()` unmodified — there is no rejection for
     // those values.
     //
-    // ArkWeb's `WebviewController.zoom()` input semantics are NOT a clean
-    // counterpart of wry's absolute contract — measured by driving the JS
-    // plugin path on an API 23 desktop device (2026-11-13): a factor in
-    // the documented (0, 100] range applies with the RESULT clamped to
-    // [1.0, 4.0]; the FIRST call from a clean state lands ≈ the factor;
-    // but a call following another `zoom()` or a native pinch can RESET
-    // the visual viewport to 1.0 or silently no-op (promise Ok, no
-    // error, no event). No input value removes that nondeterminism, so
-    // this backend sends the plain clamped target — the same input the
-    // JS plugin path (`window.__TAURI__.webview.setZoom`) sends, so both
-    // routes into `WebviewController.zoom` behave identically — and
-    // treats the actual outcome as observable-only (the onScaleChange debug
-    // log, registered in debug builds only — review #13; see the
-    // scale-change registration in `new_inner`).
-    // webview2-grade determinism is approximated on the
-    // first-call-from-clean path only.
+    // ArkWeb's `WebviewController.zoom()` is MULTIPLICATIVE, not an absolute
+    // setter (2026-11-25 device measurement, driving the fixed zoomAccess
+    // path): the factor multiplies the current visual viewport scale — ×1 is
+    // an identity (after a pinch to 1.5, zoom(1.0) leaves 1.5 and emits no
+    // scale-change event). This supersedes the 2026-11-13 "nondeterminism"
+    // read: its "reset to 1.0" was a sub-1.0-ish compound (a 0.5 factor
+    // after a 2.0 zoom lands at 1.0) and its "silent no-op" was the ×1
+    // identity. Deterministic, but relative: wry's absolute contract holds
+    // only from a clean 1.0 state — once the current scale differs (native
+    // pinch, an earlier zoom), the clamped target acts as a multiplier, and
+    // NO input restores 1.0 or zooms out (every clamped input is ≥ 1.0;
+    // recovery is reachable only through native pinch gestures). No input
+    // value changes this, so this backend sends the plain clamped target —
+    // the same input the JS plugin path
+    // (`window.__TAURI__.webview.setZoom`) sends, so both routes into
+    // `WebviewController.zoom` behave identically — and treats the actual
+    // outcome as observable-only (the onScaleChange debug log, registered
+    // in debug builds only — review #13; see the scale-change registration
+    // in `new_inner`).
     let target = clamp_zoom_target(scale_factor);
     self.dispatch_or_queue(PendingOp::Zoom { target })?;
     Ok(())
