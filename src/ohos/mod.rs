@@ -497,14 +497,18 @@ enum PendingOp {
   LoadUrlWithHeaders(String, std::collections::BTreeMap<String, String>),
   LoadHtml(String),
   Reload,
-  /// The clamped absolute zoom target wry was asked for, sent verbatim to
-  /// ArkWeb. Carries no model/delta state: under absolute-target sending a
-  /// dispatch failure simply means the zoom did not happen — the platform
-  /// stays at whatever level it had and the next call again sends its own
-  /// absolute target — so there is nothing to roll back (see
-  /// [`InnerWebView::zoom`]).
+  /// The multiplicative ArkWeb factor wry derived from the absolute zoom
+  /// target (factor = target / model at call time — see
+  /// [`InnerWebView::zoom`]). Carries no model state of its own: the model
+  /// was advanced at the `zoom` entry BEFORE dispatch, so pre-handshake
+  /// queued factors replay self-consistently (each was computed against the
+  /// model as of its own call, and the factors telescope to the last target
+  /// whichever order they land in). A synchronous dispatch refusal rolls
+  /// the model back at the entry; an ASYNC `set_zoom` failure (this arm's
+  /// Err) leaves the model optimistic — disclosed stale-baseline class,
+  /// same as the native pinch/hotkey drift.
   Zoom {
-    target: f64,
+    factor: f64,
   },
   SetBackgroundColor(String),
   SetVisible(bool),
@@ -537,16 +541,17 @@ enum PendingOp {
 /// NOT cancelled by the bridge timeout (JS has no cooperative cancellation),
 /// and its `openSync(CREATE|TRUNC)` RE-CREATES the file after an immediate
 /// delete — so the sweep must wait for the in-flight write to settle. The
-/// bridge's own 15s default timeout has already elapsed when this runs;
-/// 120s on top of that leaves a generous margin for the still-running ArkTS
-/// write before the sweep.
+/// create-pdf/print bridge calls run with the 60s heavy-action budget
+/// (companion `snapshot_call_options`, plugin-webview), which has already
+/// elapsed when this runs; 120s on top of that (180s total) leaves a
+/// generous margin for the still-running ArkTS write before the sweep.
 const PRINT_TEMP_CLEANUP_DELAY_SECS: u64 = 120;
 
 /// Review #41: best-effort delayed sweep for the `wry_print_*.pdf` temp file
 /// of a FAILED `create-pdf` step. The ArkTS-side `unlinkSync` lives only in
 /// `printPdf`'s cleanup, and `printPdf` is only reached by the "print" action
 /// — which the failed-create-pdf arm skips — so without this sweep a
-/// create_pdf failure (including the bridge's 15s timeout) leaves the temp
+/// create_pdf failure (including the bridge's 60s timeout) leaves the temp
 /// file in the sandbox forever: the ArkTS op is not cancelled by the timeout
 /// and still writes the file afterwards, with nobody left to delete it.
 ///
@@ -643,8 +648,8 @@ impl PendingOp {
           log::warn!("[wry] pending reload failed: {}", e);
         }
       }
-      PendingOp::Zoom { target } => {
-        if let Err(e) = handle.set_zoom(target).await {
+      PendingOp::Zoom { factor } => {
+        if let Err(e) = handle.set_zoom(factor).await {
           log::warn!("[wry] pending set_zoom failed: {}", e);
           // ArkWeb *can* reject a zoom call: the Web component's zoomAccess
           // switch gates WebviewController.zoom() as well as gesture zoom,
@@ -655,9 +660,12 @@ impl PendingOp {
           // [1.0, 4.0] at the `zoom` entry (see `clamp_zoom_target`): 0.0 and
           // negative finite factors BYPASS the clamp and reach ArkWeb
           // verbatim, and NaN / ±inf are rejected by the handle layer's
-          // `is_finite` precheck — surfacing HERE as the Err arm. Nothing
-          // was optimistically advanced (absolute-target sending keeps no
-          // model), so there is nothing to roll back.
+          // `is_finite` precheck — surfacing HERE as the Err arm. The
+          // tracked model was already advanced at the `zoom` entry; this
+          // late failure leaves it optimistic (the zoom never applied), the
+          // same stale-baseline class as the native pinch/hotkey drift —
+          // nothing is rolled back here because the entry cannot observe
+          // this async outcome.
         }
       }
       PendingOp::SetBackgroundColor(color) => {
@@ -701,10 +709,17 @@ impl PendingOp {
           // the sandbox forever.
           schedule_print_temp_cleanup(&path);
         } else if let Err(e) = handle.print(&path).await {
-          // ArkTS `printPdf` owns the temp-file cleanup on this arm (its
-          // body runs the unlinkSync whether the print itself succeeds or
-          // fails), so no wry-side sweep is needed here.
           log::warn!("[wry] pending print failed: {}", e);
+          // Review W29-13: the print call can fail BEFORE the ArkTS
+          // `printPdf` body runs — e.g. the webview controller was
+          // concurrently removed ("Unknown WebView controller") — and that
+          // failure path never reaches printPdf's own `unlinkSync`, so the
+          // temp PDF would leak exactly like the create-pdf arm above. When
+          // printPdf DID run and failed, its cleanup already removed the
+          // file and this sweep is a harmless no-op (NotFound = success);
+          // when a print is still in flight elsewhere the 120s settle
+          // window covers it.
+          schedule_print_temp_cleanup(&path);
         }
       }
       PendingOp::Eval(js, callback) => {
@@ -864,6 +879,22 @@ pub(crate) struct InnerWebView {
   page_loaded: Arc<AtomicBool>,
   url_cache: Arc<Mutex<String>>,
   bounds_cache: Mutex<Rect>,
+  /// Tracked model of this webview's current ArkWeb page zoom, used by
+  /// [`InnerWebView::zoom`] to convert wry's absolute `zoom` contract into
+  /// ArkWeb's multiplicative `WebviewController.zoom()` input (factor =
+  /// target / model, then model = target). Seeded at 1.0 (the default page
+  /// zoom) because ArkWeb exposes no zoom getter — the zoom family is
+  /// setters only (`zoom` / `zoomIn` ×1.25 / `zoomOut` ×0.8) — so the
+  /// current level has to be tracked cache-on-set. Drift disclosure (the
+  /// same class the 2026-11-12 model had): ArkWeb-native zoom paths outside
+  /// wry — pinch gestures and the engine-native Ctrl+=/- accelerators —
+  /// change the actual level without touching this model, so a programmatic
+  /// zoom issued after a native zoom computes its factor against a stale
+  /// baseline. A dispatch failure rolls the model back at the `zoom` entry
+  /// (the op never entered the queue), but an async `set_zoom` failure
+  /// surfaces after the model already advanced — that leaves the model
+  /// optimistic, the same stale-baseline class.
+  zoom_model: Mutex<f64>,
   /// Per-webview devtools open-state flag (#253) - written by `open_devtools`
   /// / `close_devtools`, read by `is_devtools_open`. It mirrors the actual
   /// open state, not the request intent: set on a success-shaped open path
@@ -1027,9 +1058,12 @@ const PRE_HANDSHAKE_QUEUE_CAP: usize = 1024;
 /// NOT contractually: observed arrival order rides the bridge executor's
 /// single pump thread (spawn order ≈ poll start order), an implementation
 /// detail rather than an API guarantee. Callers whose ops depend on each
-/// other's effects must not rely on back-to-back call order — under the
-/// absolute-target zoom semantics, for example, an arrival-order flip turns
-/// "the last zoom wins" into "the first zoom wins".
+/// other's effects must not rely on back-to-back call order — e.g.
+/// `load_url` followed by an `eval` that inspects the new page's DOM: an
+/// arrival-order flip runs the eval against the OLD page. (Programmatic
+/// zooms are the order-INSENSITIVE case under the tracked-model design:
+/// each call's factor is computed at call time and the factors telescope,
+/// so any arrival order lands on the same final level.)
 ///
 /// Review #16 (disposal fence): ops ARRIVING after
 /// [`InnerWebView::dispose_child`] set the fence are refused with an Err
@@ -1052,6 +1086,17 @@ const PRE_HANDSHAKE_QUEUE_CAP: usize = 1024;
 /// dead-pump arms (which also means the devtools open releases its intent,
 /// see [`queue_pre_handshake_open`]). The cap sits AFTER the dead-pump check:
 /// a dead pump is the more precise refusal and fires first.
+///
+/// Review W29-9 (Remove exemption): the cap EXEMPTS [`PendingOp::Remove`].
+/// Without the exemption a `dispose_child` against a full queue was
+/// refused; the create could still succeed later and replay the other 1024
+/// ops, but the teardown never arrived — the ArkTS `Web` component leaked
+/// permanently. A webview's `Remove` is bounded by the dispose fence (the
+/// idempotent `dispose_once` gate admits at most one), so exempting it
+/// cannot grow the queue unboundedly; refused-with-Err remains the honest
+/// answer for the other two refusal arms (creation failed: no ArkTS
+/// webview exists to leak; dead pump: the queue can never drain, so a
+/// queued Remove would never replay either).
 fn dispatch_or_queue_op(
   pending_ops: &std::sync::Mutex<Vec<PendingOp>>,
   handle: &OnceLock<WebviewHandle>,
@@ -1093,8 +1138,11 @@ fn dispatch_or_queue_op(
     Err(Error::OpenHarmonyWebviewError(
       "bridge runtime pump thread is dead; the queued op would never be replayed".into(),
     ))
-  } else if guard.len() >= PRE_HANDSHAKE_QUEUE_CAP {
-    // Review #17: bound the pre-handshake queue (see the fn doc).
+  } else if guard.len() >= PRE_HANDSHAKE_QUEUE_CAP && !matches!(op, PendingOp::Remove) {
+    // Review #17: bound the pre-handshake queue (see the fn doc). Review
+    // W29-9: `Remove` is exempt — the dispose teardown must be accepted
+    // even against a full queue, or a later-successful create replays the
+    // queued ops onto a webview whose ArkTS component is never torn down.
     Err(Error::OpenHarmonyWebviewError(format!(
       "pre-handshake queue is full ({} ops); refusing to grow it without bound while create is still pending",
       PRE_HANDSHAKE_QUEUE_CAP
@@ -1139,16 +1187,22 @@ fn set_bounds_with_cache(
   // ability-F6: the cache write skips sentinel components (the
   // tauri-runtime-wry partial-bounds wire, issue Eulogizethesun/tauri#241), so
   // `bounds()` readers must never see -2147483648.0 as a real component.
-  // Gate F3: with the pump thread dead the dispatch above is silently lost
-  // (the disclosed bridge-dead surface for non-devtools ops) - skipping the
-  // write keeps `bounds()` from reporting geometry the render layer never
-  // applied. Scope carve-out (PR#26 review round 3): this promise covers the
-  // set_bounds path only - the create-time seed write (Gate F4) is the
-  // disclosed exception: it seeds the cache with the builder bounds before
-  // any render-layer application exists, so on the two MAIN creation rows
-  // documented on `WebView::bounds` the cache does not reflect applied
-  // geometry (the default placeholder row and the requested-but-never-applied
-  // row).
+  // Gate F3 (tauri#256 review): with the pump thread dead the dispatch above
+  // is silently lost (the disclosed bridge-dead surface for
+  // fire-and-forget ops), so this path must NOT return Ok. set_bounds is the
+  // one wire whose Ok promises "the bounds cache now reflects this request"
+  // (with the disclosed exceptions below) — the old warn-and-Ok let the
+  // tauri-runtime-wry auto-resize state machine advance its
+  // bounds-explicitness on the Ok and derive later rates from a stale cache
+  // that still held creation-placeholder geometry (the pin/shrink class of
+  // issue #256). Erroring keeps both sides honest: the op would never
+  // execute AND the cache records nothing. The other ops keep the disclosed
+  // fire-and-forget bridge-dead surface — their Ok makes no cache claim.
+  // First disclosed exception: the create-time seed write (Gate F4) seeds the
+  // cache with the builder bounds before any render-layer application exists,
+  // so on the two MAIN creation rows documented on `WebView::bounds` the
+  // cache does not reflect applied geometry (the default placeholder row and
+  // the requested-but-never-applied row).
   // The second disclosed exception: while the creation handshake is
   // pending, a live pump takes the queue arm (dispatch_or_queue_op
   // queues the op and returns Ok without applying it) yet the cache
@@ -1157,13 +1211,13 @@ fn set_bounds_with_cache(
   // completes and the queue drains.
   // TOCTOU residual gap (disclosed): a thread dying right after this
   // check still leaves the cache written but unapplied.
-  if runtime.pump_thread_alive() {
-    merge_bounds_into_cache(&mut bounds_cache.lock().unwrap(), bounds);
-  } else {
-    log::warn!(
-      "[wry] set_bounds: bridge runtime pump thread is dead; the request will never be applied and the bounds cache is left unchanged"
-    );
+  if !runtime.pump_thread_alive() {
+    return Err(Error::OpenHarmonyWebviewError(
+      "bridge runtime pump thread is dead; set_bounds would never be applied and the bounds cache is left unchanged"
+        .into(),
+    ));
   }
+  merge_bounds_into_cache(&mut bounds_cache.lock().unwrap(), bounds);
   Ok(())
 }
 
@@ -1295,11 +1349,13 @@ impl InnerWebView {
 
     // Scale-change diagnostic (debug builds only, review #13): ArkWeb's
     // `onScaleChange` fires for every zoom change source — programmatic
-    // `zoom()`, pinch — and is the ONLY observable of the webview's actual
-    // zoom level: ArkWeb exposes no zoom getter, and its `zoom()` outcome is
-    // nondeterministic from non-steady states (see [`InnerWebView::zoom`]).
-    // Logged at debug level — no wry public API surfaces webview zoom changes
-    // (tao's `ScaleFactorChanged` is display DPI, a different axis).
+    // `zoom()`, pinch, engine-native Ctrl+=/- — and is the ONLY observable
+    // of the webview's actual zoom level: ArkWeb exposes no zoom getter,
+    // and `zoom()` applies a deterministic multiplicative factor whose
+    // landing level depends on the current scale (see
+    // [`InnerWebView::zoom`]). Logged at debug level — no wry public API
+    // surfaces webview zoom changes (tao's `ScaleFactorChanged` is display
+    // DPI, a different axis).
     //
     // Review #13 (gated registration): this registration used to be
     // unconditional, which cost every webview one bridge round trip per
@@ -1943,6 +1999,7 @@ impl InnerWebView {
       page_loaded,
       url_cache,
       bounds_cache: Mutex::new(bounds_cache_seed),
+      zoom_model: Mutex::new(1.0),
       #[cfg(any(debug_assertions, feature = "devtools"))]
       devtools_open,
       incognito,
@@ -2178,39 +2235,63 @@ impl InnerWebView {
 
   // Pattern A: fire-and-forget
   pub fn zoom(&self, scale_factor: f64) -> Result<()> {
-    // Absolute target, clamped to ArkWeb's effective window (webview2
-    // `SetZoomFactor` parity: clamp instead of reject — upstream wry does
-    // not pre-validate the factor on other backends either). A non-finite
-    // factor (NaN / ±inf) is NOT clamped: it passes through so the handle
-    // layer rejects it with its own logged error (plugin-webview's
-    // `set_zoom` precheck is `is_finite`, which covers only NaN / ±inf)
-    // instead of wry silently mapping garbage onto 1.0. A 0.0 or negative
-    // FINITE factor is not rejected anywhere: the Rust precheck and the
-    // ArkTS `Number.isFinite` gate both let it through, and it reaches
-    // `WebviewController.zoom()` unmodified — there is no rejection for
-    // those values.
+    // Absolute-to-relative conversion (review W29-1, restoring the
+    // 2026-11-12 tracked-model design the 2026-11-13 redesign dropped):
+    // ArkWeb's `WebviewController.zoom()` is MULTIPLICATIVE — the 2026-11-25
+    // device measurement settled this (×1 is an identity; 0.5 after a 2.0
+    // zoom lands at 1.0; it supersedes the 11-13 "nondeterminism" read,
+    // whose "reset" and "silent no-op" observations were the ×0.5 and ×1
+    // cases of plain multiplication) — while wry's contract, and every
+    // other backend (webview2 `SetZoomFactor`, wkwebview `setPageZoom`,
+    // gtk `set_zoom_level`), is an ABSOLUTE target. Sending the raw target
+    // made the absolute API relative: after `zoom(2.0)`, `zoom(1.0)` was a
+    // ×1 identity and reset was unreachable.
     //
-    // ArkWeb's `WebviewController.zoom()` is MULTIPLICATIVE, not an absolute
-    // setter (2026-11-25 device measurement, driving the fixed zoomAccess
-    // path): the factor multiplies the current visual viewport scale — ×1 is
-    // an identity (after a pinch to 1.5, zoom(1.0) leaves 1.5 and emits no
-    // scale-change event). This supersedes the 2026-11-13 "nondeterminism"
-    // read: its "reset to 1.0" was a sub-1.0-ish compound (a 0.5 factor
-    // after a 2.0 zoom lands at 1.0) and its "silent no-op" was the ×1
-    // identity. Deterministic, but relative: wry's absolute contract holds
-    // only from a clean 1.0 state — once the current scale differs (native
-    // pinch, an earlier zoom), the clamped target acts as a multiplier, and
-    // NO input restores 1.0 or zooms out (every clamped input is ≥ 1.0;
-    // recovery is reachable only through native pinch gestures). No input
-    // value changes this, so this backend sends the plain clamped target —
-    // the same input the JS plugin path
-    // (`window.__TAURI__.webview.setZoom`) sends, so both routes into
-    // `WebviewController.zoom` behave identically — and treats the actual
-    // outcome as observable-only (the onScaleChange debug log, registered
-    // in debug builds only — review #13; see the scale-change registration
-    // in `new_inner`).
+    // The conversion tracks the model cache-on-set (seeded 1.0; ArkWeb has
+    // no zoom getter) and sends factor = target / model. The model is
+    // advanced BEFORE dispatch so pre-handshake queued ops stay
+    // self-consistent: each queued factor was computed against the model
+    // as of its own call, and in-order replay preserves the product — and
+    // the factors telescope, so even a post-ready arrival-order flip
+    // (independent spawned tasks) lands on the same final level. A
+    // dispatch Err (queue full / dead pump / failed create) rolls the
+    // model back here: the op never entered the queue, so the zoom will
+    // not happen and the baseline must stay put. An ASYNC `set_zoom`
+    // failure (the warn arm in `PendingOp::execute`) arrives after the
+    // model advanced and leaves it optimistic — disclosed, same
+    // stale-baseline class as the native-path drift (see `zoom_model`).
+    //
+    // Clamping (unchanged from the redesign): a positive finite target is
+    // clamped to ArkWeb's effective result window [1.0, 4.0] (webview2
+    // `SetZoomFactor` parity: clamp instead of reject) and the model only
+    // ever holds clamped values, so the division is well-defined. A
+    // NON-finite factor (NaN / ±inf) and a 0.0 / negative finite factor
+    // are NOT clamped and NOT written to the model: they pass through so
+    // the handle layer rejects NaN / ±inf with its own logged error
+    // (`set_zoom`'s `is_finite` precheck) — 0.0 and negative finite values
+    // are rejected nowhere and reach ArkWeb verbatim (outside the
+    // contract). The applied outcome stays observable-only: the
+    // onScaleChange debug log (debug builds — release builds register no
+    // consumer); failures log at warn on every build.
     let target = clamp_zoom_target(scale_factor);
-    self.dispatch_or_queue(PendingOp::Zoom { target })?;
+    let (arkweb_factor, previous_model) = {
+      let mut model = self.zoom_model.lock().unwrap();
+      let previous = *model;
+      let factor = target / previous;
+      if scale_factor > 0.0 && scale_factor.is_finite() {
+        *model = target;
+      }
+      (factor, previous)
+    };
+    if let Err(e) = self.dispatch_or_queue(PendingOp::Zoom {
+      factor: arkweb_factor,
+    }) {
+      // Dispatch refused — the op never queued/executed. Undo the model
+      // advance so the next programmatic zoom computes against the real
+      // baseline instead of an applied-but-never-dispatched target.
+      *self.zoom_model.lock().unwrap() = previous_model;
+      return Err(e);
+    }
     Ok(())
   }
 
@@ -2248,7 +2329,17 @@ impl InnerWebView {
     let url = match domain {
       Some(d) if !d.is_empty() => format!("https://{}", d.trim_start_matches('.')),
       _ => {
-        let current_url = self.url_cache.lock().unwrap().clone();
+        // Review W29-12: same three-state freshness router as `url()` /
+        // `cookies()` — on the Main thread the sync bridge refresh picks up
+        // SPA pushState navigations the page-begin/end event cache never
+        // observes, so the cookie lands on the URL the user actually sees.
+        // Worker / Uninitialized keep the cache-only behavior (no bridge
+        // touch), the same arms `url()` documents.
+        let current_url = url_with_main_thread_refresh(
+          openharmony_ability::main_thread_status(),
+          &self.id,
+          &self.url_cache,
+        )?;
         if !current_url.is_empty() {
           current_url
         } else {
@@ -4464,6 +4555,66 @@ mod tests {
     );
   }
 
+  /// tauri#256 review: the set_bounds public path under a DEAD pump returns
+  /// Err and leaves the bounds cache untouched - an Ok here would promise
+  /// "the cache reflects this request" while the request can never be
+  /// applied (the pin/shrink class of issue #256).
+  ///
+  /// Coverage boundary (disclosed): with the handle slot empty this UT drives
+  /// the pre-handshake F2 refusal arm (`dispatch_or_queue_op` rejects the
+  /// enqueue because its replay is polled by the dead thread), and the Err
+  /// propagation through `set_bounds_with_cache` - deleting the `?` after the
+  /// dispatch would merge the refused bounds into the cache and turn this UT
+  /// red. The handle-ready + dead-pump tail (dispatch accepted the spawn, the
+  /// later `pump_thread_alive` probe then errors) needs a live NAPI
+  /// `WebviewHandle` and a terminated shared pump thread, neither of which a
+  /// UT can fabricate (same boundary as Gate F9) - disclosed only.
+  /// # Brief: 1) build the simulated-dead-pump executor 2) run the real
+  /// set_bounds body 3) assert Err 4) assert the cache and queue are
+  /// unchanged/empty.
+  #[test]
+  fn ut_set_bounds_public_path_dead_pump_errors_and_keeps_cache() {
+    let pending_ops: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
+    let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let disposed = AtomicBool::new(false);
+    let runtime = dead_pump_executor_for_ut();
+    let bounds_cache = Mutex::new(Rect {
+      position: dpi::LogicalPosition::new(10.0, 20.0).into(),
+      size: dpi::LogicalSize::new(100.0, 50.0).into(),
+    });
+
+    let result = set_bounds_with_cache(
+      &pending_ops,
+      &handle,
+      &creation_error,
+      &runtime,
+      &disposed,
+      &bounds_cache,
+      Rect {
+        position: dpi::LogicalPosition::new(1.0, 2.0).into(),
+        size: dpi::LogicalSize::new(3.0, 4.0).into(),
+      },
+    );
+
+    assert!(
+      result.is_err(),
+      "a dead pump must fail set_bounds instead of returning Ok for a request that can never be applied"
+    );
+    // bounds() read-back shape: `Ok(*bounds_cache.lock().unwrap())`.
+    let cached = *bounds_cache.lock().unwrap();
+    let (x, y) = position_components(cached.position);
+    let (w, h) = size_components(cached.size);
+    assert_eq!(x, 10.0, "a refused set_bounds must not touch the cached x");
+    assert_eq!(y, 20.0, "a refused set_bounds must not touch the cached y");
+    assert_eq!(w, 100.0, "a refused set_bounds must not touch the cached w");
+    assert_eq!(h, 50.0, "a refused set_bounds must not touch the cached h");
+    assert!(
+      pending_ops.lock().unwrap().is_empty(),
+      "a refused set_bounds must not queue anything"
+    );
+  }
+
   // #189 (design D3): the unified dispose fence.
 
   /// UT for #189: the fence fires exactly once -- a fresh webview owes the
@@ -4811,6 +4962,61 @@ mod tests {
       queue.lock().unwrap().len(),
       PRE_HANDSHAKE_QUEUE_CAP,
       "the queue must hold exactly the capped op count"
+    );
+  }
+
+  /// UT for review W29-9: the queue-full refusal EXEMPTS `Remove`. A
+  /// `dispose_child` against a full pre-handshake queue must still be
+  /// accepted: without the exemption the create could succeed later and
+  /// replay the queued ops onto a webview whose teardown never arrived —
+  /// the ArkTS `Web` component would leak permanently.
+  /// # Brief: 1) fill the queue to the cap 2) dispatch a Remove 3) assert it
+  /// is accepted and the queue holds cap+1 ops.
+  #[test]
+  fn ut_pre_handshake_queue_cap_exempts_remove() {
+    let queue: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
+    let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let runtime = BridgeExecutor::new();
+    let disposed = AtomicBool::new(false);
+
+    for _ in 0..PRE_HANDSHAKE_QUEUE_CAP {
+      dispatch_or_queue_op(
+        &queue,
+        &handle,
+        &creation_error,
+        &runtime,
+        &disposed,
+        PendingOp::Reload,
+      )
+      .expect("ops up to the cap must queue");
+    }
+    dispatch_or_queue_op(
+      &queue,
+      &handle,
+      &creation_error,
+      &runtime,
+      &disposed,
+      PendingOp::Remove,
+    )
+    .expect("Remove must be accepted even against a full queue");
+    assert_eq!(
+      queue.lock().unwrap().len(),
+      PRE_HANDSHAKE_QUEUE_CAP + 1,
+      "the exempt Remove sits in the queue for the create-drain replay"
+    );
+    // Control on the same queue: a non-Remove op is still refused.
+    assert!(
+      dispatch_or_queue_op(
+        &queue,
+        &handle,
+        &creation_error,
+        &runtime,
+        &disposed,
+        PendingOp::Reload
+      )
+      .is_err(),
+      "the non-Remove op beyond the cap stays refused"
     );
   }
 

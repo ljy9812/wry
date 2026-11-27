@@ -621,11 +621,14 @@ struct WebViewAttributes<'a> {
   ///
   /// - **macOS / Linux / Android / iOS**: Unsupported
   /// - **OHOS**: only controls whether the accelerator matcher consumes
-  ///   Ctrl+/-/0 before the page sees them. The engine (ArkWeb) has no
-  ///   keyboard page-zoom — Chromium keeps those accelerators in the browser
-  ///   layer, which ArkWeb does not ship — so `true` never *creates* keyboard
-  ///   zoom, it only stops the matcher from blocking. Pinch zoom is not
-  ///   gated by this flag on OHOS at all.
+  ///   Ctrl+/-/0 before the page sees them. Ctrl+=/- page zoom is
+  ///   ArkWeb-ENGINE-native (Chromium ships those accelerators inside the
+  ///   web engine, which ArkWeb includes), so unblocked keys zoom the
+  ///   engine directly; Ctrl+0 has no native engine binding and reaches
+  ///   the page as a plain key event. `true` therefore never *creates*
+  ///   keyboard zoom — the engine already has it — it only stops the
+  ///   matcher from blocking. Pinch zoom is not gated by this flag on
+  ///   OHOS at all.
   ///
   ///   The flag is sent for every created webview (never omitted), and the
   ///   accelerator matcher keys on the whole window: a webview created later
@@ -1397,10 +1400,12 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - **OHOS**: gestures are never gated (no WebView2-style best-effort
   ///   limitation); the flag only controls whether the accelerator matcher
-  ///   consumes Ctrl+/-/0. The engine (ArkWeb) has no keyboard page-zoom —
-  ///   Chromium keeps those accelerators in the browser layer, which ArkWeb
-  ///   does not ship — so `true` never *creates* keyboard zoom, it only
-  ///   stops the matcher from blocking.
+  ///   consumes Ctrl+/-/0. Ctrl+=/- page zoom is ArkWeb-ENGINE-native
+  ///   (Chromium ships those accelerators inside the web engine, which
+  ///   ArkWeb includes), so unblocked keys zoom the engine directly; Ctrl+0
+  ///   has no native engine binding and reaches the page as a plain key
+  ///   event. `true` therefore never *creates* keyboard zoom — the engine
+  ///   already has it — it only stops the matcher from blocking.
   ///
   /// - **macOS / Linux / Android / iOS**: Unsupported
   pub fn with_hotkeys_zoom(mut self, zoom: bool) -> Self {
@@ -2128,14 +2133,17 @@ pub trait WebViewBuilderExtOhos {
   ///
   /// ## Platform-specific
   ///
-  /// - **OpenHarmony:** a JS `window.close()` call is not delivered to the
-  ///   embedder (ArkWeb's `onWindowExit` is not wired over the bridge), and wry
-  ///   has no close-request handler field to observe one. The only honored
-  ///   close convention is a navigation to `http://close-window.invalid`, which
-  ///   the webview plugin intercepts and routes into the host window's close
-  ///   flow (a vetoable close request) **only for webviews bound to an OS
-  ///   sub-window (`window_id > 0`)**. For webviews created without a window id
-  ///   (`0`) that navigation is intercepted and swallowed with no effect.
+  /// - **OpenHarmony:** wry has no close-request handler field of its own,
+  ///   but a page's `window.close()` IS observed for webviews bound to an
+  ///   OS window with a close chain — ArkWeb's `onWindowExit` and the
+  ///   `http://close-window.invalid` navigation convention both route into
+  ///   the plugin's notify-only close path, which the embedding runtime's
+  ///   close chain drains into a vetoable `CloseRequested` (the
+  ///   unvetoed leg then performs the physical destroy). For webviews
+  ///   created without a window id (`0`) neither route exists: the
+  ///   `close-window.invalid` navigation is intercepted and swallowed, and
+  ///   `window.close()` is a no-op (the bootstrap main window is
+  ///   system-managed).
   fn with_window_id(self, window_id: i64) -> Self;
 
   /// Enables HTTPS scheme for custom protocols.
@@ -2345,12 +2353,16 @@ impl WebView {
   ///
   /// ## Platform-specific
   ///
-  /// - **OpenHarmony**: returns `Err` until the first page load has finished —
-  ///   a state gate no other backend has (webview2 evaluates `window.print()`,
-  ///   webkitgtk always returns `Ok`, wkwebview runs a print operation). The
-  ///   error text names ArkTS's "onPageEnd"; the Rust-level equivalent is
+  /// - **OpenHarmony**: returns `Err` while a page load is in flight — the
+  ///   gate is the CURRENT load, not only the first one: the flag resets on
+  ///   every `onPageBegin` and sets on the matching `onPageEnd`, so a call
+  ///   made during any navigation (begin→end window) errs, not just one
+  ///   made before the first load (a state gate no other backend has —
+  ///   webview2 evaluates `window.print()`, webkitgtk always returns `Ok`,
+  ///   wkwebview runs a print operation). The error text names ArkTS's
+  ///   "onPageEnd"; the Rust-level equivalent is
   ///   [`PageLoadEvent::Finished`] delivered to
-  ///   [`WebViewBuilder::with_on_page_load_handler`]. After the initial `Ok`,
+  ///   [`WebViewBuilder::with_on_page_load_handler`]. After an `Ok`,
   ///   later failures (including a denied print permission) are only logged
   ///   and cannot be observed from the return value.
   pub fn print(&self) -> Result<()> {
@@ -2379,7 +2391,10 @@ impl WebView {
   /// - **OpenHarmony**: the cookie is delivered through ArkWeb's
   ///   `configCookieSync` with a target URL derived from the cookie's `Domain`
   ///   attribute (always sent as `https://<domain>`), falling back to the
-  ///   current page URL when the cookie carries no domain. With neither (no
+  ///   current page URL when the cookie carries no domain — read through the
+  ///   same freshness route as `url()`/`cookies()` (main-thread sync refresh;
+  ///   worker/uninitialized threads keep the page-begin/end event cache, so
+  ///   the fallback there is the last page-begin/end URL). With neither (no
   ///   `Domain` and no page loaded yet) the call returns an error — the cookie
   ///   is not dispatched.
   pub fn set_cookie(&self, cookie: &cookie::Cookie<'_>) -> Result<()> {
@@ -2451,19 +2466,26 @@ impl WebView {
   /// - **macOS**: available on macOS 11+ only.
   /// - **iOS**: available on iOS 14+ only.
   /// - **OpenHarmony**: the only backend that rewrites the caller's input at
-  ///   this entry: the factor is silently clamped to ArkWeb's effective
-  ///   window `[1.0, 4.0]` before dispatch (webview2/webkitgtk/wkwebview
-  ///   forward it as-is), so zooming below 1.0 is impossible. The applied
-  ///   semantics is MULTIPLICATIVE (device-measured): the factor scales the
-  ///   current zoom, ×1 is an identity — so from a clean page the call lands
-  ///   on the clamped factor (absolute-looking), but once the current zoom
-  ///   differs (pinch, an earlier call) the factor compounds and NO input
-  ///   restores 1.0 or zooms out (every clamped input is ≥ 1.0); recovery is
-  ///   only reachable through native pinch gestures. The applied outcome is
-  ///   not observable from the return value — only a debug-level
-  ///   scale-change log. `NaN`/±inf pass through unclamped and are rejected
-  ///   by the handle layer; a `0.0` or negative finite factor also passes
-  ///   through unclamped (no rejection anywhere).
+  ///   this entry. The target is honored as an ABSOLUTE value for the
+  ///   programmatic path: ArkWeb's `WebviewController.zoom()` is
+  ///   multiplicative (device-measured), so wry tracks the current level
+  ///   cache-on-set and sends `factor = target / model` — `zoom(1.0)`
+  ///   restores 100% after an earlier `zoom(1.5)`. A positive finite target
+  ///   is silently clamped to ArkWeb's effective window `[1.0, 4.0]` before
+  ///   the conversion (webview2/webkitgtk/wkwebview forward it as-is), so
+  ///   zooming below 1.0 is impossible. `0.0` and negative finite factors
+  ///   are not clamped and rejected by neither wry nor the plugin — the
+  ///   ArkWeb-side behavior for those is outside this contract;
+  ///   `NaN`/±inf pass through and are rejected by the handle layer's
+  ///   precheck. ArkWeb itself can reject the call when the Web component's
+  ///   `zoomAccess` is off (the plugin pins it on at webview build). Drift
+  ///   (disclosed): native zoom paths — pinch gestures and the
+  ///   engine-native Ctrl+=/- accelerators — change the actual level
+  ///   without updating wry's model, so a programmatic zoom issued after
+  ///   those computes its factor against a stale baseline. The applied
+  ///   outcome is not observable from the return value: debug builds log
+  ///   scale changes (release builds register no scale-change consumer),
+  ///   and failures log at `warn` on every build.
   pub fn zoom(&self, scale_factor: f64) -> Result<()> {
     self.webview.zoom(scale_factor)
   }
@@ -2565,7 +2587,14 @@ impl WebView {
   ///   components (partial updates) never enter the cache - a sentinel
   ///   component keeps its previously cached value while the set components
   ///   of the same request update theirs (per-component, matching the ArkTS
-  ///   render granularity). That per-component merge holds only within one
+  ///   render granularity). A NON-FINITE component (NaN / ±inf - reachable
+  ///   only from a hand-crafted `LogicalPosition` / `LogicalSize`; a
+  ///   `Physical` variant widens from integers and can never be
+  ///   non-finite) is screened the same way: it counts as "not set" and
+  ///   keeps its cached value, instead of leaving `bounds()` readers with
+  ///   a NaN / ±inf component until a later real write overwrites it (the
+  ///   dispatched request still carries the raw value - the ArkTS render
+  ///   layer's behavior on non-finite geometry is outside this contract). That per-component merge holds only within one
   ///   dpi variant: when an incoming position or size axis carries a
   ///   different variant than the cached one (Logical vs Physical), the axis
   ///   is merged as a whole - a partial write (a sentinel component present
@@ -2611,7 +2640,9 @@ impl WebView {
   /// OpenHarmony: the OHOS backend forwards the request to the ArkTS render
   /// layer, which applies position AND size for a full request and skips
   /// `i32::MIN` sentinel components on partial requests (tauri-runtime-wry's
-  /// SetSize/SetPosition updates, issue Eulogizethesun/tauri#241); for a
+  /// SetSize/SetPosition updates, issue Eulogizethesun/tauri#241); NaN / ±inf
+  /// components are screened on the cache read-back the same way as the
+  /// sentinel (counted as "not set", see [`WebView::bounds`]). For a
   /// child webview the first `set_bounds` is an explicit-to-explicit geometry
   /// update - the create geometry was already written (for children even the
   /// 200x200 default is written as real layout), so the node is never in
@@ -2953,9 +2984,12 @@ pub trait WebViewExtOhos {
   ///
   /// `callback` receives `true` when the PDF was written to `path`.
   ///
-  /// Returns `Err` until the first page load has finished (the same
-  /// `page_loaded` gate as [`WebView::print`]); the error text names ArkTS's
-  /// "onPageEnd", whose Rust-level equivalent is [`PageLoadEvent::Finished`].
+  /// Returns `Err` while a page load is in flight (the same `page_loaded`
+  /// gate as [`WebView::print`] — the CURRENT load, not only the first:
+  /// the flag resets on every `onPageBegin` and sets on the matching
+  /// `onPageEnd`, so a call during any navigation's begin→end window
+  /// errs); the error text names ArkTS's "onPageEnd", whose Rust-level
+  /// equivalent is [`PageLoadEvent::Finished`].
   fn create_pdf(
     &self,
     path: &str,
